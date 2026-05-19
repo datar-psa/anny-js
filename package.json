@@ -1,0 +1,26 @@
+{
+  "name": "anny-js",
+  "version": "0.1.0",
+  "description": "Anny body model (Naver, Apache 2.0) — LBS skinning and FK in TypeScript for browser/Node",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist", "assets"],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/bun": "^1.1.0"
+  },
+  "keywords": ["anny", "body-model", "skinning", "lbs", "mediapipe", "avatar"],
+  "license": "Apache-2.0"
+}

@@ -1,6 +1,6 @@
 {
   "name": "anny-js",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "Live 3D body animation in the browser — FK + LBS for the Anny body model (Apache 2.0). Drives 163 bones from MediaPipe Pose at < 2 ms.",
   "type": "module",
   "main": "./dist/index.js",
@@ -11,20 +11,39 @@
       "types": "./dist/index.d.ts"
     }
   },
-  "files": ["dist", "assets", "README.md"],
+  "files": [
+    "dist",
+    "assets",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
-    "dev":   "tsc --watch",
+    "dev": "tsc --watch",
     "check": "tsc --noEmit",
-    "demo":  "bunx serve . -p 3000 --cors"
+    "demo": "bunx serve . -p 3000 --cors"
   },
   "keywords": [
-    "anny", "body-model", "skinning", "lbs", "forward-kinematics",
-    "mediapipe", "pose", "avatar", "3d", "webgl", "browser", "animation"
+    "anny",
+    "body-model",
+    "skinning",
+    "lbs",
+    "forward-kinematics",
+    "mediapipe",
+    "pose",
+    "avatar",
+    "3d",
+    "webgl",
+    "browser",
+    "animation"
   ],
   "homepage": "https://clad.you",
-  "repository": { "type": "git", "url": "https://github.com/datar-psa/anny-js.git" },
-  "bugs": { "url": "https://github.com/datar-psa/anny-js/issues" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/datar-psa/anny-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/datar-psa/anny-js/issues"
+  },
   "license": "Apache-2.0",
   "devDependencies": {
     "@types/bun": "^1.1.0",

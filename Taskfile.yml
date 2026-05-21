@@ -1,0 +1,137 @@
+version: '3'
+
+vars:
+  PKG_NAME: anny-js
+  FIREBASE_PROJECT: clad-main   # anny-js.clad.you lives under the clad Firebase project
+
+tasks:
+
+  # ── Development ────────────────────────────────────────────────────────────
+
+  build:
+    desc: Compile TypeScript → dist/
+    cmds:
+      - bunx tsc
+    sources: [src/**/*.ts, tsconfig.json]
+    generates: [dist/**/*.js]
+
+  dev:
+    desc: Watch-mode TypeScript compilation
+    cmds: [bunx tsc --watch]
+
+  check:
+    desc: Type-check without emitting
+    cmds: [bunx tsc --noEmit]
+
+  clean:
+    desc: Remove build output
+    cmds: [rm -rf dist/]
+
+  demo:
+    desc: Build then serve demos locally at http://localhost:3000
+    deps: [build]
+    cmds: [bunx serve . -p 3000 --cors]
+
+  demo:dev:
+    desc: Serve from local paths (no build needed — for fast iteration)
+    cmds: [bunx serve . -p 3000 --cors]
+
+  # ── Versioning (package.json as single source of truth) ────────────────────
+
+  bump:
+    desc: "Bump version in package.json and tag. BUMP=patch|minor|major (default: patch)"
+    vars:
+      BUMP: '{{default "patch" .BUMP}}'
+    cmds:
+      - |
+        current=$(node -p "require('./package.json').version")
+        IFS='.' read -r major minor patch <<< "$current"
+        case "{{.BUMP}}" in
+          major) major=$((major + 1)); minor=0; patch=0 ;;
+          minor) minor=$((minor + 1)); patch=0 ;;
+          patch) patch=$((patch + 1)) ;;
+          *) echo "Error: BUMP must be patch|minor|major" >&2; exit 1 ;;
+        esac
+        new="${major}.${minor}.${patch}"
+        tag="{{.PKG_NAME}}/v${new}"
+
+        if git rev-parse "$tag" >/dev/null 2>&1; then
+          echo "Error: tag $tag already exists. Tags are immutable." >&2; exit 1
+        fi
+
+        # Update package.json version in-place
+        node -e "
+          const fs = require('fs');
+          const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          p.version = '${new}';
+          fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
+        "
+
+        git add package.json
+        git commit -m "chore: bump {{.PKG_NAME}} to ${new}"
+        git tag "$tag"
+        echo "Bumped {{.PKG_NAME}}: ${current} → ${new}  (tag: ${tag})"
+
+  # ── Internal tasks ──────────────────────────────────────────────────────────
+
+  _check-clean:
+    internal: true
+    cmds:
+      - |
+        UNSTAGED=$(git diff --name-only -- "{{.TASKFILE_DIR}}")
+        STAGED=$(git diff --cached --name-only -- "{{.TASKFILE_DIR}}")
+        if [ -n "$UNSTAGED" ] || [ -n "$STAGED" ]; then
+          echo "Error: uncommitted changes — the git tag would not match what is shipped." >&2
+          [ -n "$STAGED"   ] && echo "  Staged:$(echo "$STAGED" | sed 's/^/\n    /')" >&2
+          [ -n "$UNSTAGED" ] && echo "  Unstaged:$(echo "$UNSTAGED" | sed 's/^/\n    /')" >&2
+          echo "Commit or stash changes, then retry." >&2
+          exit 1
+        fi
+
+  _build:
+    internal: true
+    deps: [check]
+    cmds:
+      - rm -rf dist/
+      - bunx tsc
+
+  _publish:
+    internal: true
+    cmds:
+      - npm publish --access public
+
+  # ── Ship (the one command to rule them all) ─────────────────────────────────
+
+  ship:
+    desc: "check-clean → bump → build → npm publish → git push. BUMP=patch|minor|major (default: patch)"
+    vars:
+      BUMP: '{{default "patch" .BUMP}}'
+    cmds:
+      - task: _check-clean
+      - task: bump
+        vars: {BUMP: "{{.BUMP}}"}
+      - task: _build
+      - task: _publish
+      - |
+          version=$(node -p "require('./package.json').version")
+          tag="{{.PKG_NAME}}/v${version}"
+          git push origin HEAD "$tag"
+          echo ""
+          echo "Shipped {{.PKG_NAME}}@${version} — available on:"
+          echo "  npm:        https://www.npmjs.com/package/{{.PKG_NAME}}"
+          echo "  jsDelivr:   https://cdn.jsdelivr.net/npm/{{.PKG_NAME}}@${version}/dist/index.js"
+          echo "  unpkg:      https://unpkg.com/{{.PKG_NAME}}@${version}/dist/index.js"
+
+  # ── Firebase Hosting (demo pages) ──────────────────────────────────────────
+
+  deploy:
+    desc: "Deploy to anny-js.clad.you (Firebase Hosting under clad-main)"
+    deps: [build]
+    cmds:
+      - firebase deploy --only hosting:{{.PKG_NAME}} --project {{.FIREBASE_PROJECT}}
+
+  deploy:init:
+    desc: "First-time setup — create anny-js site under clad-main, then add custom domain anny-js.clad.you in Firebase console"
+    cmds:
+      - firebase hosting:sites:create {{.PKG_NAME}} --project {{.FIREBASE_PROJECT}} || true
+      - echo "→ Add custom domain anny-js.clad.you in Firebase console → Hosting → anny-js site"

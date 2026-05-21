@@ -1,0 +1,9 @@
+node_modules/
+src/
+tools/
+demo/
+*.log
+.gitignore
+firebase.json
+Taskfile.yml
+tsconfig.json

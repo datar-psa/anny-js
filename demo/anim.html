@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>anny-js — animation demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #08080f; color: #ccc; font: 13px/1.5 system-ui; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #hud {
+      position: fixed; top: 0; left: 0; right: 0;
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 12px 18px; pointer-events: none;
+    }
+    h1 { font: 600 16px system-ui; color: #fff; letter-spacing: .05em; }
+    h1 span { color: #4af; }
+    #stats { font: 11px monospace; color: #4a4; }
+    #pose  { font: 12px monospace; color: #a94; text-align: right; }
+    #divH, #divV {
+      position: fixed; background: rgba(255,255,255,.07); pointer-events: none;
+    }
+    #divH { top: 50%; left: 0; right: 0; height: 1px; }
+    #divV { left: 50%; top: 0; bottom: 0; width: 1px; }
+    .lbl {
+      position: fixed; font: 10px monospace; color: rgba(255,255,255,.35);
+      pointer-events: none;
+    }
+    #footer {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 10px 18px; pointer-events: none;
+      background: linear-gradient(transparent, rgba(0,0,0,.55));
+    }
+    #footer p  { font: 11px/1.4 system-ui; color: rgba(255,255,255,.4); max-width: 520px; }
+    #footer nav { display: flex; gap: 14px; }
+    #footer a  {
+      font: 11px monospace; color: rgba(100,180,255,.7); text-decoration: none;
+      pointer-events: all;
+    }
+    #footer a:hover { color: #4af; }
+  </style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="hud">
+  <h1><span>anny</span>-js</h1>
+  <div id="stats">loading…</div>
+  <div id="pose">—</div>
+</div>
+<div id="divH"></div>
+<div id="divV"></div>
+<div id="footer">
+  <p>Live 3D body animation in the browser — FK&thinsp;+&thinsp;LBS on a 14&thinsp;718-vertex&thinsp;/&thinsp;163-bone mesh in &lt;&thinsp;2&thinsp;ms. Powered by <a href="https://github.com/naver/anny" target="_blank" rel="noopener">Anny</a> (Apache&thinsp;2.0).</p>
+  <nav>
+    <a href="https://github.com/datar-psa/anny-js" target="_blank" rel="noopener">GitHub</a>
+    <a href="https://www.npmjs.com/package/anny-js" target="_blank" rel="noopener">npm</a>
+    <a href="/live" target="_blank" rel="noopener">📷 Live demo</a>
+  </nav>
+</div>
+<div class="lbl" style="top:8px;left:8px">FRONT</div>
+<div class="lbl" style="top:8px;right:8px">BACK</div>
+<div class="lbl" id="lbl3q" style="bottom:8px;left:8px">3/4</div>
+<div class="lbl" id="lblAb" style="bottom:8px;right:8px">ABOVE</div>
+
+<script type="module">
+// ── CDN imports ─────────────────────────────────────────────────────────────
+// Swap to '../dist/index.js' for local dev
+import {
+  loadAnnyModel,
+  forwardKinematics, allocBoneTransforms, identityDeltas, setDeltas,
+  lbs, allocVertexBuffer, buildBoneIndex, rodriguesToMat3,
+} from '../dist/index.js';
+
+const W = window.innerWidth, H = window.innerHeight;
+const statsEl = document.getElementById('stats');
+const poseEl  = document.getElementById('pose');
+
+// Position labels
+document.getElementById('lbl3q').style.left = '8px';
+document.getElementById('lbl3q').style.top  = `${H/2 + 8}px`;
+document.getElementById('lblAb').style.right = '8px';
+document.getElementById('lblAb').style.top   = `${H/2 + 8}px`;
+
+// ── Load model ──────────────────────────────────────────────────────────────
+const t0 = performance.now();
+const model = await loadAnnyModel(
+  '../assets/anny_model.json',
+  '../assets/anny_model.bin',
+);
+statsEl.textContent = `loaded in ${(performance.now()-t0).toFixed(0)} ms`;
+
+const boneIndex  = buildBoneIndex(model);
+const boneXforms = allocBoneTransforms(model.boneCount);
+const vertBuf    = allocVertexBuffer(model);
+
+// ── WebGL ────────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('gl');
+canvas.width = W; canvas.height = H;
+const gl = canvas.getContext('webgl', { antialias: true, depth: true });
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compileShader(gl.VERTEX_SHADER, `
+  attribute vec3 aPos;
+  uniform float uSc, uCx, uFy, uXs, uCY, uSY, uCX, uSX;
+  uniform vec2 uVP;
+  varying float vH, vD;
+  void main() {
+    float rx = aPos.x*uCY - aPos.y*uSY;
+    float ry = aPos.x*uSY + aPos.y*uCY;
+    float rz = ry*uSX + aPos.z*uCX;
+    float rd = ry*uCX - aPos.z*uSX;
+    vH = aPos.z; vD = rd;
+    gl_Position = vec4(
+      (uCx + uXs*rx*uSc)/uVP.x*2.0 - 1.0,
+       1.0 - (uFy - rz*uSc)/uVP.y*2.0,
+       rd/5.0, 1.0);
+  }`));
+gl.attachShader(prog, compileShader(gl.FRAGMENT_SHADER, `
+  precision mediump float;
+  uniform vec4 uCol;
+  varying float vH, vD;
+  void main() {
+    float b = 0.35 + 0.65*clamp(vH/1.8,0.0,1.0);
+    float f = 0.50 + 0.50*clamp(-vD*1.5,0.0,1.0);
+    gl_FragColor = vec4(uCol.rgb*(b*0.55+f*0.45), uCol.a);
+  }`));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+const aPos = gl.getAttribLocation(prog, 'aPos');
+const U = {};
+for (const n of ['uSc','uCx','uFy','uXs','uCY','uSY','uCX','uSX','uVP','uCol'])
+  U[n] = gl.getUniformLocation(prog, n);
+
+const idxBuf = gl.createBuffer();
+const f16 = new Uint16Array(model.faces.length);
+for (let i = 0; i < model.faces.length; i++) f16[i] = model.faces[i];
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, f16, gl.STATIC_DRAW);
+
+const vtxBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vtxBuf);
+gl.bufferData(gl.ARRAY_BUFFER, model.vertCount * 12, gl.DYNAMIC_DRAW);
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+gl.cullFace(gl.BACK);
+gl.frontFace(gl.CCW);
+
+function view(cx, fy, sc, xs, ry, rx, r, g, b) {
+  gl.uniform1f(U.uSc, sc); gl.uniform1f(U.uCx, cx); gl.uniform1f(U.uFy, fy);
+  gl.uniform1f(U.uXs, xs);
+  gl.uniform1f(U.uCY, Math.cos(ry)); gl.uniform1f(U.uSY, Math.sin(ry));
+  gl.uniform1f(U.uCX, Math.cos(rx)); gl.uniform1f(U.uSX, Math.sin(rx));
+  gl.uniform4f(U.uCol, r, g, b, 1);
+  gl.drawElements(gl.TRIANGLES, model.faceCount*3, gl.UNSIGNED_SHORT, 0);
+}
+
+// ── Pose helpers ─────────────────────────────────────────────────────────────
+const deg = a => a * Math.PI / 180;
+const rotZ = a => rodriguesToMat3(new Float32Array([0,0,1]), a);
+const rotX = a => rodriguesToMat3(new Float32Array([1,0,0]), a);
+
+// Named poses
+const POSES = [
+  { name: 'A-pose',     uArmZ:  -40, lArmZ: -20, uArmX: 0,   spine: 0  },
+  { name: 'T-pose',     uArmZ:    0, lArmZ:   0, uArmX: 0,   spine: 0  },
+  { name: 'guard',      uArmZ:  -25, lArmZ: -85, uArmX: 0.3, spine: 12 },
+  { name: 'wave right', uArmZ:   75, lArmZ:  15, uArmX: 0,   spine: 0  },
+  { name: 'both up',    uArmZ:   85, lArmZ:   5, uArmX: 0,   spine: 0  },
+  { name: 'cross arms', uArmZ:  -45, lArmZ:-115, uArmX: 0.4, spine: 18 },
+  { name: 'ready',      uArmZ:  -50, lArmZ: -70, uArmX: 0.2, spine: -8 },
+];
+
+function makePose(p) {
+  const d = identityDeltas(model.boneCount);
+  setDeltas(d, model, [
+    { bone: 'upperarm01.L', rot: rotZ(deg(p.uArmZ)) },
+    { bone: 'upperarm01.R', rot: rotZ(deg(p.uArmZ)) },
+    { bone: 'lowerarm01.L', rot: rotZ(deg(p.lArmZ)) },
+    { bone: 'lowerarm01.R', rot: rotZ(deg(p.lArmZ)) },
+    { bone: 'upperleg01.L', rot: rotX(deg(-5)) },
+    { bone: 'upperleg01.R', rot: rotX(deg(-5)) },
+    { bone: 'spine01',      rot: rodriguesToMat3(new Float32Array([0,1,0]), deg(p.spine)) },
+  ]);
+  return d;
+}
+
+const allDeltas = POSES.map(makePose);
+
+// Linear interpolation of delta arrays (column-normalize for valid rotations)
+function blendDeltas(a, b, t) {
+  const I = new Float32Array([1,0,0, 0,1,0, 0,0,1]);
+  const out = identityDeltas(model.boneCount);
+  for (let i = 0; i < model.boneCount; i++) {
+    const da = a[i] ?? I, db = b[i] ?? I;
+    if (da === db) continue;
+    const r = new Float32Array(9);
+    for (let j = 0; j < 9; j++) r[j] = da[j] + (db[j]-da[j])*t;
+    // Re-normalize columns
+    for (let c = 0; c < 3; c++) {
+      let len = 0;
+      for (let row = 0; row < 3; row++) len += r[row*3+c]**2;
+      len = Math.sqrt(len) || 1;
+      for (let row = 0; row < 3; row++) r[row*3+c] /= len;
+    }
+    out[i] = r;
+  }
+  return out;
+}
+
+const smooth = t => t*t*(3-2*t);
+
+// ── Render loop ───────────────────────────────────────────────────────────────
+const HOLD_MS  = 1600;
+const TRANS_MS = 900;
+const CYCLE_MS = HOLD_MS + TRANS_MS;
+
+let fc = 0, fpsTs = performance.now(), fps = 0;
+
+function tick() {
+  requestAnimationFrame(tick);
+  const now = performance.now();
+  if (++fc % 60 === 0) {
+    fps = Math.round(fc / ((now - fpsTs) / 1000));
+    fc = 0; fpsTs = now;
+  }
+
+  const total  = CYCLE_MS * POSES.length;
+  const cycleT = now % total;
+  const pi     = Math.floor(cycleT / CYCLE_MS);
+  const ni     = (pi + 1) % POSES.length;
+  const within = (cycleT % CYCLE_MS) / CYCLE_MS;
+  const hFrac  = HOLD_MS / CYCLE_MS;
+  const t      = within > hFrac ? smooth((within - hFrac) / (1 - hFrac)) : 0;
+
+  const deltas = blendDeltas(allDeltas[pi], allDeltas[ni], t);
+  const t1 = performance.now();
+  forwardKinematics(model, deltas, boneXforms);
+  const mesh = lbs(model, boneXforms, vertBuf);
+  const ms = (performance.now() - t1).toFixed(1);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, vtxBuf);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, mesh.vertices);
+  gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(aPos);
+  gl.uniform2f(U.uVP, W, H);
+
+  gl.clearColor(0.03, 0.03, 0.06, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const sc = Math.min(W * 0.22 / 0.42, H * 0.40 / 1.7);
+  const bh = 1.7 * sc;
+  const HW = W/2, HH = H/2;
+  const pad = HH * 0.07;
+  const twist = Math.sin(now * 0.0003) * 0.12;
+
+  view(HW*0.5, pad+bh,       sc,    -1, twist,             0,   0.28, 0.60, 1.00);
+  view(HW*1.5, pad+bh,       sc,    -1, Math.PI+twist,     0,   1.00, 0.54, 0.28);
+  view(HW*0.5, HH+pad+bh,    sc,    -1, Math.PI*0.35+twist,0,   0.28, 1.00, 0.54);
+  view(HW*1.5, HH+HH*0.55,   sc*0.6, 1, twist,            0.9,  0.85, 0.28, 1.00);
+
+  statsEl.textContent = `FK+LBS ${ms} ms · ${fps} fps · ${model.vertCount.toLocaleString()} verts · ${model.boneCount} bones`;
+  poseEl.textContent  = t > 0.05
+    ? `${POSES[pi].name} → ${POSES[ni].name}`
+    : POSES[pi].name;
+}
+
+tick();
+</script>
+</body>
+</html>

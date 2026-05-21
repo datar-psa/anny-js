@@ -1,7 +1,7 @@
 {
   "name": "anny-js",
-  "version": "0.1.0",
-  "description": "Anny body model (Naver, Apache 2.0) — LBS skinning and FK in TypeScript for browser/Node",
+  "version": "0.0.0",
+  "description": "Live 3D body animation in the browser — FK + LBS for the Anny body model (Apache 2.0). Drives 163 bones from MediaPipe Pose at < 2 ms.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -11,16 +11,23 @@
       "types": "./dist/index.d.ts"
     }
   },
-  "files": ["dist", "assets"],
+  "files": ["dist", "assets", "README.md"],
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch",
-    "test": "bun test"
+    "dev":   "tsc --watch",
+    "check": "tsc --noEmit",
+    "demo":  "bunx serve . -p 3000 --cors"
   },
+  "keywords": [
+    "anny", "body-model", "skinning", "lbs", "forward-kinematics",
+    "mediapipe", "pose", "avatar", "3d", "webgl", "browser", "animation"
+  ],
+  "homepage": "https://clad.you",
+  "repository": { "type": "git", "url": "https://github.com/datar-psa/anny-js.git" },
+  "bugs": { "url": "https://github.com/datar-psa/anny-js/issues" },
+  "license": "Apache-2.0",
   "devDependencies": {
-    "typescript": "^5.4.0",
-    "@types/bun": "^1.1.0"
-  },
-  "keywords": ["anny", "body-model", "skinning", "lbs", "mediapipe", "avatar"],
-  "license": "Apache-2.0"
+    "@types/bun": "^1.1.0",
+    "typescript": "^5.4.0"
+  }
 }

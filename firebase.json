@@ -1,0 +1,25 @@
+{
+  "hosting": {
+    "site": "anny-js",
+    "public": ".",
+    "ignore": [
+      "firebase.json", ".gitignore", ".npmignore",
+      "**/node_modules/**", "src/**", "tools/**", "bun.lock"
+    ],
+    "headers": [
+      {
+        "source": "assets/anny_model.bin",
+        "headers": [{ "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }]
+      },
+      {
+        "source": "dist/**",
+        "headers": [{ "key": "Cache-Control", "value": "public, max-age=604800" }]
+      }
+    ],
+    "rewrites": [
+      { "source": "/",             "destination": "/demo/anim.html" },
+      { "source": "/live",         "destination": "/demo/live.html" },
+      { "source": "/demo",         "destination": "/demo/anim.html" }
+    ]
+  }
+}

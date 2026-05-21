@@ -19,8 +19,17 @@ export function allocBoneTransforms(boneCount: number): Float32Array {
   return new Float32Array(boneCount * 16);
 }
 
+// Scratch buffers reused across forwardKinematics calls (no allocation per frame
+// after the first call). Module-local — safe because forwardKinematics is sync.
+const _scratchD4      = new Float32Array(16);  // delta embedded in 4×4
+const _scratchT       = new Float32Array(16);  // rest @ delta
+const _scratchPose    = new Float32Array(16);  // parent @ T
+const _scratchInvRest = new Float32Array(16);  // inverse of rest
+
 /**
  * Run FK and write world-space bone transforms into `out` (B×16).
+ *
+ * Zero-allocation — call with the same `out` buffer each frame.
  *
  * @param model    Loaded AnnyModel (restBonePoses, boneParents).
  * @param deltas   PoseDeltas: length-B array, each entry is a 3×3 row-major
@@ -35,46 +44,35 @@ export function forwardKinematics(
 ): void {
   const { boneCount, boneParents, restBonePoses } = model;
 
-  // poses[b]     = world-space pose of bone b (rest @ delta composed up the chain)
-  // transforms[b]= bone transform used for LBS: pose[b] @ inv(restPose[b])
-  const poses      = new Float32Array(boneCount * 16);
-  const transforms = out;
-
-  const tmp  = new Float32Array(16);
-  const tmp2 = new Float32Array(16);
-
   for (let b = 0; b < boneCount; b++) {
-    const rest  = mat4Slice(restBonePoses, b);  // (4×4) rest pose for bone b
+    const rest  = mat4Slice(restBonePoses, b);
     const delta = deltas[b];
 
-    // Build T = rest @ delta (delta is pure rotation applied in local space)
+    // T = rest @ delta  (T points at _scratchT if delta non-null, else at rest)
     let T: Mat4;
     if (delta !== null) {
-      // Embed 3×3 rotation into 4×4 with zero translation
-      const d4 = mat4FromRot3Translation(delta, 0, 0, 0, tmp2);
-      T = mat4Mul(rest, d4, tmp);
+      mat4FromRot3Translation(delta, 0, 0, 0, _scratchD4);
+      mat4Mul(rest, _scratchD4, _scratchT);
+      T = _scratchT;
     } else {
       T = rest;
     }
 
+    // pose = parentTransform @ T   (or = T for root)
     const parentId = boneParents[b];
     let pose: Mat4;
     if (parentId < 0) {
-      // Root bone — pose = T
-      pose = new Float32Array(T);
+      pose = T;
     } else {
-      // pose = transform[parent] @ T
-      const parentTransform = mat4Slice(transforms, parentId);
-      pose = mat4Mul(parentTransform, T, new Float32Array(16));
+      const parentTransform = mat4Slice(out, parentId);
+      mat4Mul(parentTransform, T, _scratchPose);
+      pose = _scratchPose;
     }
 
-    // Store pose (needed so children can access it via transforms[b] later)
-    poses.set(pose, b * 16);
-
-    // transform[b] = pose[b] @ inv(restPose[b])
-    const invRest = mat4InvertRigid(rest);
-    const boneTransform = mat4Mul(pose, invRest);
-    transforms.set(boneTransform, b * 16);
+    // transform[b] = pose @ inv(rest) — written directly into the output slot.
+    // Safe: out[b*16..] is not aliased by pose, T, or parentTransform (parentId < b).
+    mat4InvertRigid(rest, _scratchInvRest);
+    mat4Mul(pose, _scratchInvRest, out.subarray(b * 16, b * 16 + 16));
   }
 }
 

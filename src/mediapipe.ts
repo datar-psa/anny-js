@@ -1,292 +1,606 @@
 /**
- * MediaPipe Pose → Anny bone delta rotations.
+ * MediaPipe Pose + Hand → Anny bone delta rotations.
  *
- * Converts 33 normalized MediaPipe landmarks to local delta rotations for
- * Anny's FK.  Anny FK applies delta as:
+ * Drives the full body chain (spine, neck, head, arms, legs, feet) plus
+ * optional hands (38 finger bones) from MediaPipe Tasks Vision output.
  *
- *   T = rest_bone_pose @ delta
- *   transform = parent_transform @ T @ inv(rest_bone_pose)
+ * Design notes
+ * ────────────
+ * • Uses **worldLandmarks** (3D metric, hip-centered) rather than image-space
+ *   landmarks. MediaPipe's image-space `z` is noisy and depth-only; world
+ *   landmarks are properly 3D and don't fight aspect ratios.
  *
- * So `delta` must be in the BONE-LOCAL frame, not world space.
- * For each limb bone whose Blender-convention Y-axis points along the bone:
+ * • Deltas are computed in **topological bone order** while a running
+ *   accumulated rotation (`R_acc`) is maintained per bone. Child bones see
+ *   the TRUE parent rotation, not just the parent's delta in isolation.
+ *   This fixes the grand-parent error that affected wrist/finger bones in v0.
  *
- *   local_target = inv(rest_bone_R) @ observed_world_dir
- *   delta = rotFromTo([0,1,0], local_target)
+ * • For each driven bone we solve:
  *
- * where rest_bone_R is the 3×3 rotation block of rest_bone_poses[b].
+ *       pose_R[b] = R_acc[parent] @ inv(rest_R[parent]) @ rest_R[b] @ delta_R[b]
+ *       (= rest_R[b] @ delta_R[b]   when parent = root)
+ *
+ *   For a Y-axis-along-bone target `y_world` (limbs, fingers):
+ *       delta_R[b] = rotFromTo([0,1,0], inv(chain) @ y_world)
+ *       where chain = R_acc[parent] @ inv(rest_R[parent]) @ rest_R[b].
+ *
+ *   For a full-rotation target `world_R` (spine — preserves torso yaw):
+ *       delta_R[b] = inv(chain) @ world_R
+ *
+ * • Angle clamping for direction targets is a *MediaPipe-specific* robustness
+ *   measure (lives here, not in core math), bounding bad-landmark damage to a
+ *   single bone — adjacent bones aren't dragged along thanks to the per-bone
+ *   chain accumulation.
+ *
+ * • Coordinate conversion (MP world ↔ Anny world):
+ *       MP world:  +x = subject's anatomical right, +y = down,    +z = away from camera
+ *       Anny:      +x = subject's anatomical left,  +y = depth back, +z = up
+ *     ⇒  anny = [-mp.x, +mp.z, -mp.y]
  */
 
-import { normalize3, rotFromTo, mulMat3, dot3, cross } from "./math.js";
+import { cross, normalize3, rodriguesToMat3 } from "./math.js";
 import { identityDeltas } from "./fk.js";
 import type { AnnyModel, PoseDeltas } from "./types.js";
 
-/** MediaPipe Pose landmark indices. */
+// ── MediaPipe landmark types & indices ─────────────────────────────────────
+
+/** A MediaPipe image-space landmark (normalized 0..1 with depth). */
+export interface Landmark {
+  x: number;
+  y: number;
+  z?: number;
+  visibility?: number;
+}
+
+/** A MediaPipe world-space landmark (metric, hip-centered). */
+export interface WorldLandmark {
+  x: number;
+  y: number;
+  z: number;
+  visibility?: number;
+}
+
+/** MediaPipe Pose Landmarker — 33 landmark indices. */
 export const MP = {
-  NOSE:             0,
-  LEFT_EAR:         7,
-  RIGHT_EAR:        8,
-  LEFT_SHOULDER:   11,
-  RIGHT_SHOULDER:  12,
-  LEFT_ELBOW:      13,
-  RIGHT_ELBOW:     14,
-  LEFT_WRIST:      15,
-  RIGHT_WRIST:     16,
-  LEFT_PINKY:      17,
-  RIGHT_PINKY:     18,
-  LEFT_INDEX:      19,
-  RIGHT_INDEX:     20,
-  LEFT_THUMB:      21,
-  RIGHT_THUMB:     22,
-  LEFT_HIP:        23,
-  RIGHT_HIP:       24,
-  LEFT_KNEE:       25,
-  RIGHT_KNEE:      26,
-  LEFT_ANKLE:      27,
-  RIGHT_ANKLE:     28,
+  NOSE: 0,
+  LEFT_EYE_INNER: 1, LEFT_EYE: 2, LEFT_EYE_OUTER: 3,
+  RIGHT_EYE_INNER: 4, RIGHT_EYE: 5, RIGHT_EYE_OUTER: 6,
+  LEFT_EAR: 7, RIGHT_EAR: 8,
+  MOUTH_LEFT: 9, MOUTH_RIGHT: 10,
+  LEFT_SHOULDER: 11, RIGHT_SHOULDER: 12,
+  LEFT_ELBOW: 13, RIGHT_ELBOW: 14,
+  LEFT_WRIST: 15, RIGHT_WRIST: 16,
+  LEFT_PINKY: 17, RIGHT_PINKY: 18,
+  LEFT_INDEX: 19, RIGHT_INDEX: 20,
+  LEFT_THUMB: 21, RIGHT_THUMB: 22,
+  LEFT_HIP: 23, RIGHT_HIP: 24,
+  LEFT_KNEE: 25, RIGHT_KNEE: 26,
+  LEFT_ANKLE: 27, RIGHT_ANKLE: 28,
+  LEFT_HEEL: 29, RIGHT_HEEL: 30,
+  LEFT_FOOT_INDEX: 31, RIGHT_FOOT_INDEX: 32,
 } as const;
 
-export interface Landmark { x: number; y: number; z?: number; visibility?: number }
+/** MediaPipe Hand Landmarker — 21 landmark indices (per hand). */
+export const MP_HAND = {
+  WRIST: 0,
+  THUMB_CMC: 1, THUMB_MCP: 2, THUMB_IP: 3, THUMB_TIP: 4,
+  INDEX_MCP: 5, INDEX_PIP: 6, INDEX_DIP: 7, INDEX_TIP: 8,
+  MIDDLE_MCP: 9, MIDDLE_PIP: 10, MIDDLE_DIP: 11, MIDDLE_TIP: 12,
+  RING_MCP: 13, RING_PIP: 14, RING_DIP: 15, RING_TIP: 16,
+  PINKY_MCP: 17, PINKY_PIP: 18, PINKY_DIP: 19, PINKY_TIP: 20,
+} as const;
 
-// ── helpers ────────────────────────────────────────────────────────────────
-
-/** Extract 3×3 rotation from flat (B×16) rest-bone-pose buffer. Row-major. */
-function restRot3(restBonePoses: Float32Array, boneIdx: number): Float32Array {
-  const b = boneIdx * 16;
-  return new Float32Array([
-    restBonePoses[b+ 0], restBonePoses[b+ 1], restBonePoses[b+ 2],
-    restBonePoses[b+ 4], restBonePoses[b+ 5], restBonePoses[b+ 6],
-    restBonePoses[b+ 8], restBonePoses[b+ 9], restBonePoses[b+10],
-  ]);
-}
-
-/** Transpose a 3×3 (= inverse for pure rotation matrices). */
-function transpose3(m: Float32Array): Float32Array {
-  return new Float32Array([
-    m[0], m[3], m[6],
-    m[1], m[4], m[7],
-    m[2], m[5], m[8],
-  ]);
-}
-
-/** Multiply 3×3 row-major matrix by column 3-vector. */
-function mulR3v3(m: Float32Array, v: Float32Array): Float32Array {
-  return new Float32Array([
-    m[0]*v[0] + m[1]*v[1] + m[2]*v[2],
-    m[3]*v[0] + m[4]*v[1] + m[5]*v[2],
-    m[6]*v[0] + m[7]*v[1] + m[8]*v[2],
-  ]);
-}
+// ── Local mat3 helpers (row-major, in-place variants for hot path) ─────────
 
 const Y_AXIS = new Float32Array([0, 1, 0]);
+const IDENTITY3 = new Float32Array([1,0,0, 0,1,0, 0,0,1]);
 
-/**
- * For a bone whose Y-axis (Blender convention) points along the limb,
- * compute the local delta rotation that swings the bone to align its world
- * Y-axis with `worldDir`.
- */
-function limbDelta(
-  worldDir: Float32Array,
-  boneIdx: number,
-  restBonePoses: Float32Array,
-): Float32Array {
-  const R    = restRot3(restBonePoses, boneIdx);
-  const invR = transpose3(R);
-  const localDir = normalize3(mulR3v3(invR, worldDir));
-  return rotFromTo(Y_AXIS, localDir);
+/** out = a @ b   (3×3 row-major). May alias `a` and `b` because we use a temp. */
+function mulMat3Into(a: Float32Array, b: Float32Array, out: Float32Array): void {
+  const a0=a[0],a1=a[1],a2=a[2],a3=a[3],a4=a[4],a5=a[5],a6=a[6],a7=a[7],a8=a[8];
+  const b0=b[0],b1=b[1],b2=b[2],b3=b[3],b4=b[4],b5=b[5],b6=b[6],b7=b[7],b8=b[8];
+  out[0] = a0*b0 + a1*b3 + a2*b6;
+  out[1] = a0*b1 + a1*b4 + a2*b7;
+  out[2] = a0*b2 + a1*b5 + a2*b8;
+  out[3] = a3*b0 + a4*b3 + a5*b6;
+  out[4] = a3*b1 + a4*b4 + a5*b7;
+  out[5] = a3*b2 + a4*b5 + a5*b8;
+  out[6] = a6*b0 + a7*b3 + a8*b6;
+  out[7] = a6*b1 + a7*b4 + a8*b7;
+  out[8] = a6*b2 + a7*b5 + a8*b8;
+}
+
+/** out = mᵀ. May alias `m`. */
+function transpose3Into(m: Float32Array, out: Float32Array): void {
+  const m0=m[0],m1=m[1],m2=m[2],m3=m[3],m5=m[5],m6=m[6],m7=m[7];
+  out[0]=m0; out[1]=m3; out[2]=m6;
+  out[3]=m1; out[4]=m[4]; out[5]=m7;
+  out[6]=m2; out[7]=m5; out[8]=m[8];
+}
+
+/** out = m @ v   (3×3 row-major × column-vec). */
+function mulMat3VecInto(m: Float32Array, v: Float32Array, out: Float32Array): void {
+  const v0=v[0],v1=v[1],v2=v[2];
+  out[0] = m[0]*v0 + m[1]*v1 + m[2]*v2;
+  out[1] = m[3]*v0 + m[4]*v1 + m[5]*v2;
+  out[2] = m[6]*v0 + m[7]*v1 + m[8]*v2;
+}
+
+/** Extract a bone's 3×3 rest rotation from the (B×16) restBonePoses buffer. */
+function extractRestRot3(restBonePoses: Float32Array, boneIdx: number, out: Float32Array, outOffset: number): void {
+  const b = boneIdx * 16;
+  out[outOffset+0] = restBonePoses[b+ 0];
+  out[outOffset+1] = restBonePoses[b+ 1];
+  out[outOffset+2] = restBonePoses[b+ 2];
+  out[outOffset+3] = restBonePoses[b+ 4];
+  out[outOffset+4] = restBonePoses[b+ 5];
+  out[outOffset+5] = restBonePoses[b+ 6];
+  out[outOffset+6] = restBonePoses[b+ 8];
+  out[outOffset+7] = restBonePoses[b+ 9];
+  out[outOffset+8] = restBonePoses[b+10];
 }
 
 /**
- * Elbow/knee relative bend delta.
- *
- * Computes the rotation from the parent bone direction to the child bone
- * direction, both projected into the child bone's local rest frame.
- * Depth (Y) is zeroed before projection — MediaPipe depth is noisy and
- * causes spurious forward/backward bending at elbow and knee joints.
- *
- * Straight limb: both project to same local direction → identity delta. ✓
+ * MediaPipe-specific clamped rotation. Returns the smallest-angle 3×3
+ * rotation mapping `from`→`to`, but caps the angle at `maxAngle` to bound
+ * the damage a single bad landmark can do.
  */
-/**
- * Parent-corrected child bone delta.
- *
- * `limbDelta` alone is wrong for child bones (forearm, shin) because the
- * parent's FK transform is NOT identity — it has already rotated the bone
- * chain.  Without correction, `limbDelta(forearmWorldDir)` over-rotates by
- * the parent's rotation.
- *
- * Fix: pre-multiply the child world direction by inv(R_transform_parent),
- * which "undoes" the parent's world rotation before mapping to local space.
- *
- *   inv(R_transform_parent) = R_par @ inv(R_delta_par) @ inv(R_par)
- *   R_delta_par              = rotFromTo(e_y, inv(R_par) @ parentWorldDir)
- *
- * For a straight limb (childWorldDir ≈ parentWorldDir):
- *   adjusted = inv(R_transform_par) @ parentWorldDir
- *   limbDelta(adjusted, ...) → arm is straight in Anny.  ✓
- */
-function childLimbDelta(
-  parentWorldDir: Float32Array,
-  childWorldDir:  Float32Array,
-  parentBoneIdx: number,
-  childBoneIdx:  number,
-  restBonePoses: Float32Array,
-): Float32Array {
-  // Parent rest rotation and its inverse
-  const R_par    = restRot3(restBonePoses, parentBoneIdx);
-  const invR_par = transpose3(R_par);
+function clampedRotFromTo(from: Float32Array, to: Float32Array, maxAngle: number): Float32Array {
+  const ax = from[1]*to[2] - from[2]*to[1];
+  const ay = from[2]*to[0] - from[0]*to[2];
+  const az = from[0]*to[1] - from[1]*to[0];
+  const sinA = Math.hypot(ax, ay, az);
+  const cosA = from[0]*to[0] + from[1]*to[1] + from[2]*to[2];
 
-  // Delta applied to parent bone (from limbDelta logic)
-  const parentLocal = normalize3(mulR3v3(invR_par, parentWorldDir));
-  const R_delta_par = rotFromTo(Y_AXIS, parentLocal);         // 3×3
-  const invDelta    = transpose3(R_delta_par);               // inv(R_delta_par)
-
-  // inv(R_transform_parent) = R_par @ invDelta @ invR_par
-  const inv_R_transform_par = mulMat3(R_par, mulMat3(invDelta, invR_par));
-
-  // Adjust child world direction to cancel parent's accumulated transform
-  const adjustedDir = normalize3(mulR3v3(inv_R_transform_par, childWorldDir));
-
-  return limbDelta(adjustedDir, childBoneIdx, restBonePoses);
+  if (sinA < 1e-8) {
+    if (cosA > 0) return new Float32Array(IDENTITY3);
+    // antiparallel — 180° around any axis perpendicular to `from`
+    const perp = Math.abs(from[0]) < 0.9
+      ? new Float32Array([1, 0, 0])
+      : new Float32Array([0, 1, 0]);
+    return rodriguesToMat3(normalize3(cross(from, perp)), Math.min(Math.PI, maxAngle));
+  }
+  const inv = 1 / sinA;
+  const axis = new Float32Array([ax*inv, ay*inv, az*inv]);
+  return rodriguesToMat3(axis, Math.min(Math.atan2(sinA, cosA), maxAngle));
 }
 
-// ── public API ─────────────────────────────────────────────────────────────
-
-/** Minimum visibility score for upper-body landmarks. */
-const VIS_MIN = 0.5;
-/** Lower threshold for legs — still track in partial occlusion / low light. */
-const VIS_LEG = 0.3;
+// ── MediaPipe → Anny world coordinate conversion ───────────────────────────
 
 /**
- * Convert MediaPipe pose landmarks to Anny PoseDeltas.
+ * Convert a MediaPipe world landmark to Anny world coordinates.
  *
- * @param landmarks  33-element array from MediaPipe (normalized 0-1, z = depth).
- * @param model      Loaded AnnyModel.
- * @param boneIndex  Map from bone label → index (build once with buildBoneIndex).
- * @param mirrorX    Flip X axis. False for a standard front-facing webcam (MediaPipe
- *                   operates on raw camera data, unaffected by CSS scaleX(-1)).
+ *   MP world:  +x = subject's anatomical left, +y = down,        +z = away from camera
+ *   Anny:      +x = subject's anatomical left, +y = depth (back), +z = up
+ *
+ * (MP world matches the 2D image-landmark convention: subject's anatomical
+ * left appears at large image-x because the camera doesn't mirror, so MP
+ * world +x is on the same side as image +x.)
+ *
+ * `mirrorX` flips x after conversion — only set true if upstream already
+ * mirrored the landmarks. Default false (standard MediaPipe output).
  */
-export function landmarksToPoseDeltas(
-  landmarks: Landmark[],
+function mpToAnny(lm: WorldLandmark, mirrorX: boolean, out: Float32Array): void {
+  out[0] = (mirrorX ? -1 : +1) * lm.x;
+  out[1] = lm.z;
+  out[2] = -lm.y;
+}
+
+// ── Bone target builders ───────────────────────────────────────────────────
+
+/**
+ * A target orientation for one bone, used by the topological FK below.
+ * `dir` aligns the bone's local Y axis to `worldY` and leaves twist
+ * unconstrained. `rot` pins the bone's full world rotation (used for spine
+ * to preserve torso twist around vertical).
+ */
+type BoneTarget =
+  | { kind: "dir"; worldY: Float32Array }
+  | { kind: "rot"; worldR: Float32Array };
+
+interface TargetCtx {
+  pose: WorldLandmark[];
+  mirrorX: boolean;
+  visMin: number;
+  /** Reusable scratch — `mp(i, out)` writes into out. */
+  scratch: Float32Array[];
+}
+
+/** Get a Pose landmark in Anny coords. Uses ctx.scratch[i] — do not store across calls. */
+function poseAt(ctx: TargetCtx, i: number): Float32Array {
+  mpToAnny(ctx.pose[i], ctx.mirrorX, ctx.scratch[i]);
+  return ctx.scratch[i];
+}
+
+function visible(lm: WorldLandmark | undefined, threshold: number): boolean {
+  return lm !== undefined && (lm.visibility ?? 1) >= threshold;
+}
+
+function pairVisible(ctx: TargetCtx, a: number, b: number): boolean {
+  return visible(ctx.pose[a], ctx.visMin) && visible(ctx.pose[b], ctx.visMin);
+}
+
+function normSub(a: Float32Array, b: Float32Array): Float32Array {
+  const out = new Float32Array([a[0]-b[0], a[1]-b[1], a[2]-b[2]]);
+  return normalize3(out);
+}
+
+function midpoint(a: Float32Array, b: Float32Array): Float32Array {
+  return new Float32Array([(a[0]+b[0])*0.5, (a[1]+b[1])*0.5, (a[2]+b[2])*0.5]);
+}
+
+function buildBodyTargets(ctx: TargetCtx, out: Map<string, BoneTarget>): void {
+  // ── spine03: full rotation frame (torso bend + twist around vertical) ──
+  // Driving the topmost spine bone (spine01) creates a hinge just below the
+  // shoulders. spine03 sits roughly at the lumbar/lower-thoracic transition —
+  // a much more natural pivot. Everything above (spine02, spine01, neck,
+  // head, shoulders, arms) inherits the rotation through the chain, so the
+  // upper torso stays a rigid block that rotates with the shoulders.
+  if (pairVisible(ctx, MP.LEFT_SHOULDER, MP.RIGHT_SHOULDER) &&
+      pairVisible(ctx, MP.LEFT_HIP, MP.RIGHT_HIP)) {
+    const ls = new Float32Array(poseAt(ctx, MP.LEFT_SHOULDER));
+    const rs = new Float32Array(poseAt(ctx, MP.RIGHT_SHOULDER));
+    const lh = new Float32Array(poseAt(ctx, MP.LEFT_HIP));
+    const rh = new Float32Array(poseAt(ctx, MP.RIGHT_HIP));
+
+    const shdMid = midpoint(ls, rs);
+    const hipMid = midpoint(lh, rh);
+    // Y along the spine (hip → shoulder midpoint)
+    const y = normSub(shdMid, hipMid);
+    // X across shoulders (anatomical-left direction)
+    const xRaw = normSub(ls, rs);
+    // Orthogonalise X against Y → pure left-right; renormalise
+    const dxy = xRaw[0]*y[0] + xRaw[1]*y[1] + xRaw[2]*y[2];
+    const x = normalize3(new Float32Array([
+      xRaw[0] - dxy*y[0], xRaw[1] - dxy*y[1], xRaw[2] - dxy*y[2],
+    ]));
+    // Z = X × Y completes the right-handed frame (points "out of chest")
+    const z = normalize3(cross(x, y));
+    // Row-major 3×3 where columns are the world basis vectors that local
+    // [1,0,0], [0,1,0], [0,0,1] map to. Matches Anny's spine rest convention:
+    // local X = anatomical-left, local Y = along bone, local Z = out of chest.
+    const worldR = new Float32Array([
+      x[0], y[0], z[0],
+      x[1], y[1], z[1],
+      x[2], y[2], z[2],
+    ]);
+    out.set("spine03", { kind: "rot", worldR });
+  }
+
+  // ── neck01: shoulder-mid → ear-mid ──
+  if (pairVisible(ctx, MP.LEFT_EAR, MP.RIGHT_EAR) &&
+      pairVisible(ctx, MP.LEFT_SHOULDER, MP.RIGHT_SHOULDER)) {
+    const le = new Float32Array(poseAt(ctx, MP.LEFT_EAR));
+    const re = new Float32Array(poseAt(ctx, MP.RIGHT_EAR));
+    const ls = new Float32Array(poseAt(ctx, MP.LEFT_SHOULDER));
+    const rs = new Float32Array(poseAt(ctx, MP.RIGHT_SHOULDER));
+    out.set("neck01", { kind: "dir", worldY: normSub(midpoint(le, re), midpoint(ls, rs)) });
+  }
+
+  // ── head: full rotation frame from ears + nose ──
+  // Anny's `head` bone has local X = anatomical-left, Y = up through skull,
+  // Z = forward out of face. Driving it as a Y-direction target would force
+  // "up" to align with "nose direction" → tilts the head 90° to look at the
+  // floor. Build the proper frame instead.
+  if (visible(ctx.pose[MP.NOSE], ctx.visMin) &&
+      pairVisible(ctx, MP.LEFT_EAR, MP.RIGHT_EAR)) {
+    const le = new Float32Array(poseAt(ctx, MP.LEFT_EAR));
+    const re = new Float32Array(poseAt(ctx, MP.RIGHT_EAR));
+    const ns = new Float32Array(poseAt(ctx, MP.NOSE));
+    const earMid = midpoint(le, re);
+    // X = anatomical-left across the head
+    const x = normSub(le, re);
+    // Z (forward, out of face) = (nose - earMid) projected ⊥ X
+    const zRaw = new Float32Array([ns[0]-earMid[0], ns[1]-earMid[1], ns[2]-earMid[2]]);
+    const dzx = zRaw[0]*x[0] + zRaw[1]*x[1] + zRaw[2]*x[2];
+    const z = normalize3(new Float32Array([
+      zRaw[0] - dzx*x[0], zRaw[1] - dzx*x[1], zRaw[2] - dzx*x[2],
+    ]));
+    // Y = Z × X (right-hand rule completes the frame; encodes chin-up/down)
+    const y = normalize3(cross(z, x));
+    const worldR = new Float32Array([
+      x[0], y[0], z[0],
+      x[1], y[1], z[1],
+      x[2], y[2], z[2],
+    ]);
+    out.set("head", { kind: "rot", worldR });
+  }
+
+  // ── Arms ──
+  arm(ctx, out, "L", MP.LEFT_SHOULDER, MP.LEFT_ELBOW, MP.LEFT_WRIST, MP.LEFT_INDEX);
+  arm(ctx, out, "R", MP.RIGHT_SHOULDER, MP.RIGHT_ELBOW, MP.RIGHT_WRIST, MP.RIGHT_INDEX);
+
+  // ── Legs ──
+  leg(ctx, out, "L", MP.LEFT_HIP, MP.LEFT_KNEE, MP.LEFT_ANKLE, MP.LEFT_FOOT_INDEX);
+  leg(ctx, out, "R", MP.RIGHT_HIP, MP.RIGHT_KNEE, MP.RIGHT_ANKLE, MP.RIGHT_FOOT_INDEX);
+}
+
+function arm(
+  ctx: TargetCtx, out: Map<string, BoneTarget>, side: "L"|"R",
+  SH: number, EL: number, WR: number, IX: number,
+): void {
+  if (pairVisible(ctx, SH, EL)) {
+    const a = new Float32Array(poseAt(ctx, SH)), b = new Float32Array(poseAt(ctx, EL));
+    out.set(`upperarm01.${side}`, { kind: "dir", worldY: normSub(b, a) });
+  }
+  if (pairVisible(ctx, EL, WR)) {
+    const a = new Float32Array(poseAt(ctx, EL)), b = new Float32Array(poseAt(ctx, WR));
+    out.set(`lowerarm01.${side}`, { kind: "dir", worldY: normSub(b, a) });
+  }
+  // Pose-only wrist: hand driver will override with a better signal if present.
+  if (pairVisible(ctx, WR, IX)) {
+    const a = new Float32Array(poseAt(ctx, WR)), b = new Float32Array(poseAt(ctx, IX));
+    out.set(`wrist.${side}`, { kind: "dir", worldY: normSub(b, a) });
+  }
+}
+
+function leg(
+  ctx: TargetCtx, out: Map<string, BoneTarget>, side: "L"|"R",
+  HP: number, KN: number, AN: number, FI: number,
+): void {
+  if (pairVisible(ctx, HP, KN)) {
+    const a = new Float32Array(poseAt(ctx, HP)), b = new Float32Array(poseAt(ctx, KN));
+    out.set(`upperleg01.${side}`, { kind: "dir", worldY: normSub(b, a) });
+  }
+  if (pairVisible(ctx, KN, AN)) {
+    const a = new Float32Array(poseAt(ctx, KN)), b = new Float32Array(poseAt(ctx, AN));
+    out.set(`lowerleg01.${side}`, { kind: "dir", worldY: normSub(b, a) });
+  }
+  if (pairVisible(ctx, AN, FI)) {
+    const a = new Float32Array(poseAt(ctx, AN)), b = new Float32Array(poseAt(ctx, FI));
+    out.set(`foot.${side}`, { kind: "dir", worldY: normSub(b, a) });
+  }
+}
+
+/**
+ * Map MP Hand landmarks (21) → finger bone targets (19 per hand).
+ *
+ * Anny rig:
+ *   • Thumb (3 phalanges, no metacarpal): finger1-1, finger1-2, finger1-3
+ *   • Index/Middle/Ring/Pinky (metacarpal + 3 phalanges):
+ *       metacarpal{1,2,3,4} → finger{2,3,4,5}-{1,2,3}
+ *
+ * Also drives `wrist.{L,R}` from MP hand's wrist→middle-MCP, overriding the
+ * coarse pose-only direction.
+ */
+function buildHandTargets(
+  hand: WorldLandmark[],
+  side: "L"|"R",
+  mirrorX: boolean,
+  out: Map<string, BoneTarget>,
+): void {
+  // Pre-convert all 21 landmarks once.
+  const pts: Float32Array[] = new Array(21);
+  for (let i = 0; i < 21; i++) {
+    pts[i] = new Float32Array(3);
+    mpToAnny(hand[i], mirrorX, pts[i]);
+  }
+  const dir = (a: number, b: number) => normSub(pts[b], pts[a]);
+
+  // Wrist orientation (overrides body's wrist→index proxy)
+  out.set(`wrist.${side}`, { kind: "dir", worldY: dir(MP_HAND.WRIST, MP_HAND.MIDDLE_MCP) });
+
+  // Thumb
+  out.set(`finger1-1.${side}`, { kind: "dir", worldY: dir(MP_HAND.THUMB_CMC, MP_HAND.THUMB_MCP) });
+  out.set(`finger1-2.${side}`, { kind: "dir", worldY: dir(MP_HAND.THUMB_MCP, MP_HAND.THUMB_IP) });
+  out.set(`finger1-3.${side}`, { kind: "dir", worldY: dir(MP_HAND.THUMB_IP, MP_HAND.THUMB_TIP) });
+
+  // Fingers 2-5 (index, middle, ring, pinky)
+  const fingers: ReadonlyArray<{ name: string; mc: number; pip: number; dip: number; tip: number; meta: string }> = [
+    { name: "finger2", meta: "metacarpal1", mc: MP_HAND.INDEX_MCP,  pip: MP_HAND.INDEX_PIP,  dip: MP_HAND.INDEX_DIP,  tip: MP_HAND.INDEX_TIP  },
+    { name: "finger3", meta: "metacarpal2", mc: MP_HAND.MIDDLE_MCP, pip: MP_HAND.MIDDLE_PIP, dip: MP_HAND.MIDDLE_DIP, tip: MP_HAND.MIDDLE_TIP },
+    { name: "finger4", meta: "metacarpal3", mc: MP_HAND.RING_MCP,   pip: MP_HAND.RING_PIP,   dip: MP_HAND.RING_DIP,   tip: MP_HAND.RING_TIP   },
+    { name: "finger5", meta: "metacarpal4", mc: MP_HAND.PINKY_MCP,  pip: MP_HAND.PINKY_PIP,  dip: MP_HAND.PINKY_DIP,  tip: MP_HAND.PINKY_TIP  },
+  ];
+  for (const f of fingers) {
+    out.set(`${f.meta}.${side}`,   { kind: "dir", worldY: dir(MP_HAND.WRIST, f.mc) });
+    out.set(`${f.name}-1.${side}`, { kind: "dir", worldY: dir(f.mc, f.pip) });
+    out.set(`${f.name}-2.${side}`, { kind: "dir", worldY: dir(f.pip, f.dip) });
+    out.set(`${f.name}-3.${side}`, { kind: "dir", worldY: dir(f.dip, f.tip) });
+  }
+}
+
+// ── Topological delta computation (the heart of the driver) ────────────────
+
+/**
+ * Walk bones in topological order (parents before children — Anny stores
+ * them in this order natively), and for each driven bone compute the local
+ * delta from the accumulated parent world rotation. Maintains a per-bone
+ * 3×3 `R_acc` so child bones see their true parent orientation.
+ */
+function computeDeltas(
   model: AnnyModel,
-  boneIndex: Map<string, number>,
-  mirrorX = true
+  targets: Map<number, BoneTarget>,
+  maxAngle: number,
 ): PoseDeltas {
-  const deltas = identityDeltas(model.boneCount);
-  const { restBonePoses } = model;
+  const N = model.boneCount;
+  const deltas = identityDeltas(N);
 
-  // Anny native space is Z-up: X=anatomical-left, Y=depth(forward), Z=up.
-  // MediaPipe: x right (flip for mirrorX), y increases downward, z = depth (positive=further).
-  //   Anny X = -lm.x (mirrorX) or lm.x            → lateral (anatomical left = +)
-  //   Anny Y = +(lm.z ?? 0)                          → depth (Anny front=-Y, lm.z positive=further=+Y back)
-  //   Anny Z = -lm.y                                → vertical (up = + since image y is down)
-  const mpVec = (idx: number): Float32Array => {
-    const lm = landmarks[idx];
-    const sx = mirrorX ? -lm.x : lm.x;
-    return new Float32Array([sx, lm.z ?? 0, -lm.y]);
-  };
-
-  // True if both landmarks are visible enough to trust
-  const vis = (a: number, b: number) =>
-    (landmarks[a].visibility ?? 1) >= VIS_MIN &&
-    (landmarks[b].visibility ?? 1) >= VIS_MIN;
-
-  // Normalised direction A → B in Anny world space
-  const boneDir = (a: number, b: number): Float32Array => {
-    const va = mpVec(a), vb = mpVec(b);
-    return normalize3(new Float32Array([vb[0]-va[0], vb[1]-va[1], vb[2]-va[2]]));
-  };
-
-  // Helper: look up bone index (returns -1 if missing)
-  const bi = (name: string) => boneIndex.get(name) ?? -1;
-
-  // Project direction onto XZ plane (zero out Y/depth).
-  // Used for arms and legs — MediaPipe depth is noisy and the rest bone poses
-  // have baked-in Y components that cause phantom forward rotation.
-  const xzOnly = (v: Float32Array) => normalize3(new Float32Array([v[0], 0, v[2]]));
-
-  // ── Hip and shoulder rotation frames ─────────────────────────────────────
-  // Build full 3×3 rotation matrices for hips and shoulders.
-  // Y = lean direction (XZ only, no depth pitch).
-  // X = left–right vector with full 3D depth → encodes the twist/yaw.
-  // Z = cross(X, Y) completes the right-handed frame.
-  const lh = mpVec(MP.LEFT_HIP),      rh = mpVec(MP.RIGHT_HIP);
-  const ls = mpVec(MP.LEFT_SHOULDER), rs = mpVec(MP.RIGHT_SHOULDER);
-  const hipMidX = (lh[0]+rh[0])/2, hipMidZ = (lh[2]+rh[2])/2;
-  const shdMidX = (ls[0]+rs[0])/2, shdMidZ = (ls[2]+rs[2])/2;
-
-  const yW = normalize3(new Float32Array([shdMidX-hipMidX, 0, shdMidZ-hipMidZ]));
-
-  const buildFrame = (xRaw: Float32Array): Float32Array => {
-    const d = dot3(xRaw, yW);
-    const x = normalize3(new Float32Array([xRaw[0]-d*yW[0], xRaw[1]-d*yW[1], xRaw[2]-d*yW[2]]));
-    const z = normalize3(cross(x, yW));
-    return new Float32Array([x[0],yW[0],z[0], x[1],yW[1],z[1], x[2],yW[2],z[2]]);
-  };
-  const R_shl = buildFrame(new Float32Array([ls[0]-rs[0], ls[1]-rs[1], ls[2]-rs[2]]));
-  void buildFrame(new Float32Array([lh[0]-rh[0], lh[1]-rh[1], lh[2]-rh[2]]));  // R_hip reserved for future root-bone drive
-
-  // ── Spine — shoulder twist only (spine01) ─────────────────────────────
-  // Driving pelvis/spine05 with a rotation frame destroys the figure because
-  // pelvis.L/R point LATERALLY (not up) — their rest orientation is incompatible
-  // with a vertical rotation frame.  Hips remain stationary; upper body twists.
-  const spineIdx = bi("spine01");
-  if (spineIdx >= 0)
-    deltas[spineIdx] = mulMat3(transpose3(restRot3(restBonePoses, spineIdx)), R_shl);
-
-  // ── Arms — XZ only (zero Y/depth): MediaPipe arm depth is noisy and the
-  //    lowerarm rest has a large baked-in Y component that causes phantom bend.
-  //    Arms move in the XZ plane; depth is irrelevant for most poses.
-  const uDirL = xzOnly(boneDir(MP.LEFT_SHOULDER,  MP.LEFT_ELBOW));
-  const uDirR = xzOnly(boneDir(MP.RIGHT_SHOULDER, MP.RIGHT_ELBOW));
-  const idxUL = bi("upperarm01.L"), idxUR = bi("upperarm01.R");
-  if (idxUL >= 0 && vis(MP.LEFT_SHOULDER,  MP.LEFT_ELBOW))  deltas[idxUL] = limbDelta(uDirL, idxUL, restBonePoses);
-  if (idxUR >= 0 && vis(MP.RIGHT_SHOULDER, MP.RIGHT_ELBOW)) deltas[idxUR] = limbDelta(uDirR, idxUR, restBonePoses);
-
-  const fDirL = xzOnly(boneDir(MP.LEFT_ELBOW,  MP.LEFT_WRIST));
-  const fDirR = xzOnly(boneDir(MP.RIGHT_ELBOW, MP.RIGHT_WRIST));
-  const idxFL = bi("lowerarm01.L"), idxFR = bi("lowerarm01.R");
-  if (idxFL >= 0 && vis(MP.LEFT_ELBOW,  MP.LEFT_WRIST))  deltas[idxFL] = childLimbDelta(uDirL, fDirL, idxUL, idxFL, restBonePoses);
-  if (idxFR >= 0 && vis(MP.RIGHT_ELBOW, MP.RIGHT_WRIST)) deltas[idxFR] = childLimbDelta(uDirR, fDirR, idxUR, idxFR, restBonePoses);
-
-  // Wrist: wrist→index encodes wrist roll; falls back to forearm dir.
-  const wLIdx = bi("wrist.L"), wRIdx = bi("wrist.R");
-  if (wLIdx >= 0) {
-    const wDirL = vis(MP.LEFT_WRIST, MP.LEFT_INDEX) ? boneDir(MP.LEFT_WRIST, MP.LEFT_INDEX) : fDirL;
-    deltas[wLIdx] = childLimbDelta(fDirL, wDirL, idxFL, wLIdx, restBonePoses);
-  }
-  if (wRIdx >= 0) {
-    const wDirR = vis(MP.RIGHT_WRIST, MP.RIGHT_INDEX) ? boneDir(MP.RIGHT_WRIST, MP.RIGHT_INDEX) : fDirR;
-    deltas[wRIdx] = childLimbDelta(fDirR, wDirR, idxFR, wRIdx, restBonePoses);
+  // Pre-extract rest rotations into a packed (N×9) buffer.
+  const restR = new Float32Array(N * 9);
+  for (let b = 0; b < N; b++) {
+    extractRestRot3(model.restBonePoses, b, restR, b * 9);
   }
 
-  // ── Legs ──────────────────────────────────────────────────────────────
-  const thDirL = boneDir(MP.LEFT_HIP,   MP.LEFT_KNEE);
-  const thDirR = boneDir(MP.RIGHT_HIP,  MP.RIGHT_KNEE);
-  const idxTL = bi("upperleg01.L"), idxTR = bi("upperleg01.R");
-  // Legs use lower visibility threshold (VIS_LEG) to track in low light / partial occlusion.
-  const visLeg = (a: number, b: number) =>
-    (landmarks[a].visibility ?? 1) >= VIS_LEG && (landmarks[b].visibility ?? 1) >= VIS_LEG;
-  const thDirLxz = xzOnly(thDirL), thDirRxz = xzOnly(thDirR);
+  const R_acc = new Float32Array(N * 9);  // pose_R[b] per bone
 
-  if (idxTL >= 0 && visLeg(MP.LEFT_HIP,  MP.LEFT_KNEE))  deltas[idxTL] = limbDelta(thDirLxz, idxTL, restBonePoses);
-  if (idxTR >= 0 && visLeg(MP.RIGHT_HIP, MP.RIGHT_KNEE)) deltas[idxTR] = limbDelta(thDirRxz, idxTR, restBonePoses);
+  // Scratch buffers
+  const chain    = new Float32Array(9);
+  const invChain = new Float32Array(9);
+  const tmp9a    = new Float32Array(9);
+  const tmp9b    = new Float32Array(9);
+  const tmp3     = new Float32Array(3);
 
-  const shDirL = boneDir(MP.LEFT_KNEE,  MP.LEFT_ANKLE);
-  const shDirR = boneDir(MP.RIGHT_KNEE, MP.RIGHT_ANKLE);
-  const shDirLxz = xzOnly(shDirL), shDirRxz = xzOnly(shDirR);
-  const idxSL = bi("lowerleg01.L"), idxSR = bi("lowerleg01.R");
-  if (idxSL >= 0 && visLeg(MP.LEFT_KNEE,  MP.LEFT_ANKLE))  deltas[idxSL] = childLimbDelta(thDirLxz, shDirLxz, idxTL, idxSL, restBonePoses);
-  if (idxSR >= 0 && visLeg(MP.RIGHT_KNEE, MP.RIGHT_ANKLE)) deltas[idxSR] = childLimbDelta(thDirRxz, shDirRxz, idxTR, idxSR, restBonePoses);
+  for (let b = 0; b < N; b++) {
+    const parent = model.boneParents[b];
 
-  // ── Head / neck ────────────────────────────────────────────────────────
-  // Shoulder-mid → ear-mid; XZ-only; parent-corrected through spine01.
-  {
-    const le = mpVec(MP.LEFT_EAR), re = mpVec(MP.RIGHT_EAR);
-    const earMidX = (le[0]+re[0])/2, earMidZ = (le[2]+re[2])/2;
-    const neckDir = normalize3(new Float32Array([earMidX-shdMidX, 0, earMidZ-shdMidZ]));
-    const neckIdx = bi("neck01");
-    if (neckIdx >= 0 && spineIdx >= 0)
-      deltas[neckIdx] = childLimbDelta(yW, neckDir, spineIdx, neckIdx, restBonePoses);
+    // chain = restR[b]                                              (root)
+    //       = R_acc[parent] @ inv(restR[parent]) @ restR[b]         (non-root)
+    if (parent < 0) {
+      chain.set(restR.subarray(b*9, b*9+9));
+    } else {
+      const restPar = restR.subarray(parent*9, parent*9+9);
+      const restB   = restR.subarray(b*9, b*9+9);
+      const RaccPar = R_acc.subarray(parent*9, parent*9+9);
+      transpose3Into(restPar, tmp9a);          // tmp9a = inv(restR[parent])
+      mulMat3Into(tmp9a, restB, tmp9b);        // tmp9b = inv(restR[par]) @ restR[b]
+      mulMat3Into(RaccPar, tmp9b, chain);      // chain = R_acc[par] @ tmp9b
+    }
+
+    const target = targets.get(b);
+    let delta: Float32Array | null = null;
+
+    if (target !== undefined) {
+      transpose3Into(chain, invChain);
+
+      if (target.kind === "dir") {
+        // localTarget = inv(chain) @ worldY
+        mulMat3VecInto(invChain, target.worldY, tmp3);
+        normalize3(tmp3);
+        delta = clampedRotFromTo(Y_AXIS, tmp3, maxAngle);
+      } else {
+        // kind === "rot": delta = inv(chain) @ worldR
+        delta = new Float32Array(9);
+        mulMat3Into(invChain, target.worldR, delta);
+      }
+      deltas[b] = delta;
+
+      // R_acc[b] = chain @ delta
+      mulMat3Into(chain, delta, tmp9a);
+      R_acc.set(tmp9a, b * 9);
+    } else {
+      // No delta — R_acc[b] = chain (which equals pose_R[b] for identity delta)
+      R_acc.set(chain, b * 9);
+    }
   }
 
   return deltas;
+}
+
+// ── Public API ─────────────────────────────────────────────────────────────
+
+export interface PoseInput {
+  /** 33 MediaPipe Pose worldLandmarks (metric, hip-centered). Required. */
+  pose: WorldLandmark[];
+  /** 21 MediaPipe Hand worldLandmarks for the left hand. Optional. */
+  leftHand?: WorldLandmark[];
+  /** 21 MediaPipe Hand worldLandmarks for the right hand. Optional. */
+  rightHand?: WorldLandmark[];
+  /**
+   * Flip Anny X axis. Only set true if your upstream is already mirrored.
+   * Standard MediaPipe output is subject-relative — leave false. Default: false.
+   */
+  mirrorX?: boolean;
+  /** Minimum landmark visibility to drive a bone (default 0.5). */
+  visibilityMin?: number;
+  /**
+   * Maximum delta rotation angle per bone in radians, applied to `dir`
+   * targets only. Bounds the damage a single bad landmark can do.
+   * Default 2.5 rad (~143°).
+   */
+  maxAngleRad?: number;
+}
+
+/**
+ * Convert MediaPipe Pose + Hand worldLandmarks to Anny PoseDeltas, ready to
+ * feed into `forwardKinematics()`.
+ *
+ * Drives the full body chain (spine, neck, head, arms, legs, feet) and, when
+ * hand landmarks are supplied, all 38 finger bones plus a precise wrist
+ * orientation.
+ *
+ * @param input      Landmark inputs + options.
+ * @param model      Loaded AnnyModel.
+ * @param boneIndex  Map from bone label → index (build once with buildBoneIndex).
+ */
+export function landmarksToPoseDeltas(
+  input: PoseInput,
+  model: AnnyModel,
+  boneIndex: Map<string, number>,
+): PoseDeltas {
+  const {
+    pose,
+    leftHand,
+    rightHand,
+    mirrorX = false,
+    visibilityMin = 0.5,
+    maxAngleRad = 2.5,
+  } = input;
+
+  const ctx: TargetCtx = {
+    pose,
+    mirrorX,
+    visMin: visibilityMin,
+    scratch: Array.from({ length: pose.length }, () => new Float32Array(3)),
+  };
+
+  // 1. Collect named targets from body + hands.
+  const named = new Map<string, BoneTarget>();
+  buildBodyTargets(ctx, named);
+  if (leftHand)  buildHandTargets(leftHand,  "L", mirrorX, named);
+  if (rightHand) buildHandTargets(rightHand, "R", mirrorX, named);
+
+  // 2. Resolve bone names → indices.
+  const byIdx = new Map<number, BoneTarget>();
+  for (const [name, t] of named) {
+    const idx = boneIndex.get(name);
+    if (idx !== undefined) byIdx.set(idx, t);
+  }
+
+  // 3. Run topological delta computation.
+  return computeDeltas(model, byIdx, maxAngleRad);
+}
+
+// ── Hand-side assignment helper ────────────────────────────────────────────
+
+/**
+ * Pick which detected hand is left vs right, using proximity of each hand's
+ * 2D wrist landmark to the body's LEFT_WRIST / RIGHT_WRIST in image space.
+ *
+ * MediaPipe Hand Landmarker also returns a `handedness` label per hand, but
+ * the label is computed in raw camera space and can be flipped vs. user
+ * expectation when the display is mirrored. Proximity-to-body-wrist is more
+ * robust and doesn't depend on which side of the camera the user is on.
+ *
+ * @param handsImageLandmarks  HandLandmarker `result.landmarks` (image-space).
+ * @param handsWorldLandmarks  HandLandmarker `result.worldLandmarks`.
+ * @param poseImageLandmarks   PoseLandmarker `result.landmarks[0]` (image-space).
+ * @returns                    Assigned world-space landmark arrays for the API.
+ */
+export function assignHands(
+  handsImageLandmarks: Landmark[][],
+  handsWorldLandmarks: WorldLandmark[][],
+  poseImageLandmarks: Landmark[],
+): { leftHand?: WorldLandmark[]; rightHand?: WorldLandmark[] } {
+  const out: { leftHand?: WorldLandmark[]; rightHand?: WorldLandmark[] } = {};
+  if (handsImageLandmarks.length === 0) return out;
+
+  const bodyL = poseImageLandmarks[MP.LEFT_WRIST];
+  const bodyR = poseImageLandmarks[MP.RIGHT_WRIST];
+  if (!bodyL || !bodyR) return out;
+
+  const sq = (a: Landmark, b: Landmark) =>
+    (a.x - b.x)**2 + (a.y - b.y)**2;
+
+  if (handsImageLandmarks.length === 1) {
+    const w = handsImageLandmarks[0][MP_HAND.WRIST];
+    if (sq(w, bodyL) < sq(w, bodyR)) out.leftHand = handsWorldLandmarks[0];
+    else                              out.rightHand = handsWorldLandmarks[0];
+    return out;
+  }
+
+  // ≥2 detected: pick the assignment with minimum total mismatch.
+  const [a, b] = handsImageLandmarks;
+  const wa = a[MP_HAND.WRIST];
+  const wb = b[MP_HAND.WRIST];
+  const costAB = sq(wa, bodyL) + sq(wb, bodyR);
+  const costBA = sq(wb, bodyL) + sq(wa, bodyR);
+  if (costAB <= costBA) {
+    out.leftHand  = handsWorldLandmarks[0];
+    out.rightHand = handsWorldLandmarks[1];
+  } else {
+    out.leftHand  = handsWorldLandmarks[1];
+    out.rightHand = handsWorldLandmarks[0];
+  }
+  return out;
 }

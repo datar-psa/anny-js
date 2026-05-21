@@ -17,9 +17,10 @@
       }
     ],
     "rewrites": [
-      { "source": "/",             "destination": "/demo/anim.html" },
-      { "source": "/live",         "destination": "/demo/live.html" },
-      { "source": "/demo",         "destination": "/demo/anim.html" }
+      { "source": "/",                  "destination": "/demo/anim.html" },
+      { "source": "/demo",              "destination": "/demo/anim.html" },
+      { "source": "/demo/mediapipe",    "destination": "/demo/live.html" },
+      { "source": "/live",              "destination": "/demo/live.html" }
     ]
   }
 }

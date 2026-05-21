@@ -91,13 +91,13 @@ export function dot3(a: Float32Array, b: Float32Array): number {
   return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
 }
 
-/** Max rotation angle applied by rotFromTo — clamps wild poses from bad landmarks. */
-const MAX_ANGLE = 2.1;  // ~120°
-
 /**
- * Build rotation matrix that rotates `from` unit-vec to `to` unit-vec.
- * Returns row-major 3×3 Float32Array.
- * Angle is clamped to MAX_ANGLE to prevent bad landmarks from collapsing the mesh.
+ * Build the smallest-angle rotation matrix that takes `from` unit-vec to `to`
+ * unit-vec.  Returns a row-major 3×3 Float32Array.
+ *
+ * Pure geometric mapping with no angle clamp — callers that need to bound
+ * the magnitude (e.g. the MediaPipe driver, where bad landmarks can produce
+ * mesh-collapsing rotations) should clamp the result themselves.
  */
 export function rotFromTo(from: Float32Array, to: Float32Array): Float32Array {
   const axis = cross(from, to);
@@ -106,16 +106,15 @@ export function rotFromTo(from: Float32Array, to: Float32Array): Float32Array {
 
   if (sinA < 1e-8) {
     if (cosA > 0) return new Float32Array([1,0,0, 0,1,0, 0,0,1]);
+    // Antiparallel: 180° around any axis ⟂ `from`.
     const perp = Math.abs(from[0]) < 0.9
       ? new Float32Array([1,0,0])
       : new Float32Array([0,1,0]);
-    const ax = normalize3(cross(from, perp));
-    return rodriguesToMat3(ax, Math.min(Math.PI, MAX_ANGLE));
+    return rodriguesToMat3(normalize3(cross(from, perp)), Math.PI);
   }
 
   normalize3(axis);
-  const angle = Math.min(Math.atan2(sinA, cosA), MAX_ANGLE);
-  return rodriguesToMat3(axis, angle);
+  return rodriguesToMat3(axis, Math.atan2(sinA, cosA));
 }
 
 /** Rodrigues rotation matrix from axis (unit) + angle (radians). Row-major 3×3. */

@@ -47,6 +47,7 @@
   "license": "Apache-2.0",
   "devDependencies": {
     "@types/bun": "^1.1.0",
+    "playwright": "^1.60.0",
     "typescript": "^5.4.0"
   }
 }

@@ -24,14 +24,13 @@
   <canvas id="c"></canvas>
 
   <script type="module">
-    import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+    import { PoseLandmarker, HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
     import {
       loadAnnyModel,
-      forwardKinematics, allocBoneTransforms, identityDeltas,
+      forwardKinematics, allocBoneTransforms,
       lbs, allocVertexBuffer,
-      buildBoneIndex, landmarksToPoseDeltas,
-      // renderAnny,  // replaced by WebGL glView()
-    } from "https://cdn.jsdelivr.net/npm/anny-js/dist/index.js";
+      buildBoneIndex, landmarksToPoseDeltas, assignHands,
+    } from "../dist/index.js";
 
     const W = window.innerWidth, H = window.innerHeight;
     const canvas = document.getElementById("c");
@@ -42,25 +41,40 @@
 
     // ── 1. Load Anny model ──────────────────────────────────────────────
     const t0 = performance.now();
-    const model = await loadAnnyModel("https://cdn.jsdelivr.net/npm/anny-js/assets/anny_model.json", "https://cdn.jsdelivr.net/npm/anny-js/assets/anny_model.bin");
-    statusEl.textContent = `Anny loaded ${(performance.now()-t0).toFixed(0)} ms — starting camera…`;
+    const model = await loadAnnyModel("../assets/anny_model.json", "../assets/anny_model.bin");
+    statusEl.textContent = `Anny loaded ${(performance.now()-t0).toFixed(0)} ms — starting MediaPipe…`;
 
     const boneIndex    = buildBoneIndex(model);
     const boneXforms   = allocBoneTransforms(model.boneCount);
     const vertBuf      = allocVertexBuffer(model);
 
-    // ── 2. MediaPipe PoseLandmarker ────────────────────────────────────
+    // Foot-level offset: Anny's rest mesh may have min Z slightly below 0.
+    let minRestZ = 0;
+    for (let i = 2; i < model.restVertices.length; i += 3)
+      if (model.restVertices[i] < minRestZ) minRestZ = model.restVertices[i];
+
+    // ── 2. MediaPipe Pose + Hand landmarkers ───────────────────────────
     const vision = await FilesetResolver.forVisionTasks(
       "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
     );
-    const landmarker = await PoseLandmarker.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-        delegate: "GPU",
-      },
-      runningMode: "VIDEO",
-      numPoses: 1,
-    });
+    const [poseLandmarker, handLandmarker] = await Promise.all([
+      PoseLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+          delegate: "GPU",
+        },
+        runningMode: "VIDEO",
+        numPoses: 1,
+      }),
+      HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU",
+        },
+        runningMode: "VIDEO",
+        numHands: 2,
+      }),
+    ]);
     statusEl.textContent = "MediaPipe ready — requesting camera…";
 
     // ── 3. Webcam ───────────────────────────────────────────────────────
@@ -80,125 +94,195 @@
     console.log("[GPU]", gpuName);
     statusEl.textContent = `✓ Live — GPU: ${gpuName.substring(0,40)}`;
 
-    const vertSrc = `
-      attribute vec3 aPos;
-      uniform float uScale, uCx, uFootY, uXSign, uCosY, uSinY, uCosX, uSinX;
-      uniform vec2 uVP;
-      varying float vDepth;
-      varying float vHeight;
-      void main() {
-        float rx = aPos.x*uCosY - aPos.y*uSinY;
-        float ry = aPos.x*uSinY + aPos.y*uCosY;
-        float rz = ry*uSinX + aPos.z*uCosX;
-        float rd = ry*uCosX - aPos.z*uSinX;
-        float px = uCx + uXSign*rx*uScale;
-        float py = uFootY - rz*uScale;
-        vDepth  = rd;                    // depth: negative = toward viewer
-        vHeight = aPos.z;                // world-space height for top-lighting
-        gl_Position = vec4(px/uVP.x*2.0-1.0, 1.0-py/uVP.y*2.0, rd/5.0, 1.0);
-      }`;
-    // Simple shading: top-lit (height) + front-lit (depth), no extension needed.
-    const fragSrc = `
-      precision mediump float;
-      uniform vec4 uColor;
-      varying float vDepth;
-      varying float vHeight;
-      void main() {
-        float topLight   = 0.4 + 0.6 * clamp(vHeight / 1.8, 0.0, 1.0);
-        float frontLight = 0.5 + 0.5 * clamp(-vDepth * 1.5, 0.0, 1.0);
-        float brightness = topLight * 0.5 + frontLight * 0.5;
-        gl_FragColor = vec4(uColor.rgb * brightness, uColor.a);
-      }`;
-
     const compile = (type, src) => {
       const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
       if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
-        console.error("Shader compile error:", gl.getShaderInfoLog(s), "\n---\n", src);
+        console.error("Shader compile error:", gl.getShaderInfoLog(s));
       return s;
     };
+
+    // ── Body shader — world rotation + camera + face-normal lighting ───────────
     const prog = gl.createProgram();
-    gl.attachShader(prog, compile(gl.VERTEX_SHADER, vertSrc));
-    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fragSrc));
-    // Log link errors
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
-      console.error("Shader link error:", gl.getProgramInfoLog(prog));
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, `
+      attribute vec3 aPos;
+      uniform float uSc,uCx,uFy,uXs,uCY,uSY,uCX,uSX,uWX,uWS;
+      uniform vec2 uVP;
+      varying vec3 vViewPos;
+      varying float vH,vD;
+      void main(){
+        float py=aPos.y*uWX-aPos.z*uWS, pz=aPos.y*uWS+aPos.z*uWX;
+        float rx=aPos.x*uCY-py*uSY, ry=aPos.x*uSY+py*uCY;
+        float rz=ry*uSX+pz*uCX, rd=ry*uCX-pz*uSX;
+        float sx=uCx+uXs*rx*uSc, sy=uFy-rz*uSc;
+        vViewPos=vec3(sx,sy,rd*uSc); vH=pz; vD=rd;
+        gl_Position=vec4(sx/uVP.x*2.-1.,1.-sy/uVP.y*2.,rd/5.,1.);
+      }`));
+    const hasD = !!gl.getExtension("OES_standard_derivatives");
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, hasD ? `
+      #extension GL_OES_standard_derivatives : enable
+      precision mediump float;
+      uniform vec4 uCol;
+      varying vec3 vViewPos; varying float vH,vD;
+      void main(){
+        vec3 n=normalize(cross(dFdx(vViewPos),dFdy(vViewPos)));
+        float key =max(dot(n,normalize(vec3( 0.3,-0.8, 0.6))),0.);
+        float fill=max(dot(n,normalize(vec3( 0.8, 0.2, 0.3))),0.);
+        float rim =max(dot(n,normalize(vec3(-0.2, 0.6,-0.8))),0.);
+        gl_FragColor=vec4(uCol.rgb*(0.28+0.52*key+0.14*fill+0.06*rim*rim),1.);
+      }` : `
+      precision mediump float;
+      uniform vec4 uCol; varying float vH,vD;
+      void main(){
+        float t=0.35+0.65*clamp(vH/1.8,0.,1.);
+        float f=0.50+0.50*clamp(-vD*1.4,0.,1.);
+        gl_FragColor=vec4(uCol.rgb*(t*.5+f*.5),1.);
+      }`));
     gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+      console.error("Body shader link error:", gl.getProgramInfoLog(prog));
     gl.useProgram(prog);
 
-    const aPos  = gl.getAttribLocation(prog, "aPos");
+    const aPos = gl.getAttribLocation(prog, "aPos");
     const uLocs = {};
-    for (const n of ["uScale","uCx","uFootY","uXSign","uCosY","uSinY","uCosX","uSinX","uVP","uColor"])
+    for (const n of ["uSc","uCx","uFy","uXs","uCY","uSY","uCX","uSX","uWX","uWS","uVP","uCol"])
       uLocs[n] = gl.getUniformLocation(prog, n);
 
-    // Static face index buffer (Uint16 — max vertex index 13717 < 65535)
+    // ── Grid shader — camera only (no world rotation, floor is static) ─────────
+    const gridProg = gl.createProgram();
+    gl.attachShader(gridProg, compile(gl.VERTEX_SHADER, `
+      attribute vec3 aPos;
+      uniform float uSc,uCx,uFy,uXs,uCY,uSY,uCX,uSX; uniform vec2 uVP;
+      void main(){
+        float rx=aPos.x*uCY-aPos.y*uSY, ry=aPos.x*uSY+aPos.y*uCY;
+        float rz=ry*uSX+aPos.z*uCX, rd=ry*uCX-aPos.z*uSX;
+        gl_Position=vec4((uCx+uXs*rx*uSc)/uVP.x*2.-1.,1.-(uFy-rz*uSc)/uVP.y*2.,rd/5.+.001,1.);
+      }`));
+    gl.attachShader(gridProg, compile(gl.FRAGMENT_SHADER,
+      "precision mediump float; void main(){gl_FragColor=vec4(.28,.28,.34,.5);}"));
+    gl.linkProgram(gridProg);
+    const gAPos = gl.getAttribLocation(gridProg, "aPos");
+    const gU = {};
+    for (const n of ["uSc","uCx","uFy","uXs","uCY","uSY","uCX","uSX","uVP"])
+      gU[n] = gl.getUniformLocation(gridProg, n);
+
+    const gridVerts = []; const gr = 1.4, gs = gr*2/20;
+    for (let i = 0; i <= 20; i++){
+      const v = -gr+i*gs;
+      gridVerts.push(v,-gr,0, v,gr,0, -gr,v,0, gr,v,0);
+    }
+    const gridBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, gridBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(gridVerts), gl.STATIC_DRAW);
+
+    // ── Shared buffers ─────────────────────────────────────────────────────────
     const idxBuf = gl.createBuffer();
     const faces16 = new Uint16Array(model.faces.length);
     for (let i = 0; i < model.faces.length; i++) faces16[i] = model.faces[i];
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, faces16, gl.STATIC_DRAW);
 
-    // Dynamic vertex position buffer (updated each frame after LBS)
     const vtxBufGL = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, vtxBufGL);
     gl.bufferData(gl.ARRAY_BUFFER, model.vertCount * 12, gl.DYNAMIC_DRAW);
 
-    gl.enable(gl.DEPTH_TEST);
-    gl.enable(gl.CULL_FACE);
-    gl.cullFace(gl.BACK);
-    gl.frontFace(gl.CCW);  // standard: CCW in NDC = front-facing
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE);
+    gl.cullFace(gl.BACK); gl.frontFace(gl.CCW);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-    function glView(cx, footY, scale, xSign, rotY, rotX, r, g, b) {
-      gl.uniform1f(uLocs.uScale, scale);
-      gl.uniform1f(uLocs.uCx,    cx);
-      gl.uniform1f(uLocs.uFootY, footY);
-      gl.uniform1f(uLocs.uXSign, xSign);
-      gl.uniform1f(uLocs.uCosY,  Math.cos(rotY));
-      gl.uniform1f(uLocs.uSinY,  Math.sin(rotY));
-      gl.uniform1f(uLocs.uCosX,  Math.cos(rotX));
-      gl.uniform1f(uLocs.uSinX,  Math.sin(rotX));
-      gl.uniform4f(uLocs.uColor, r, g, b, 1.0);
-      gl.drawElements(gl.TRIANGLES, model.faceCount * 3, gl.UNSIGNED_SHORT, 0);
+    // World twist (hip yaw) — set once per frame, shared by all body views
+    let _wx=1, _ws=0;
+    function setWorldTwist(a){ _wx=Math.cos(a); _ws=Math.sin(a); }
+
+    function applyProj(locs, cx,fy,sc,xs,camY,camX){
+      gl.uniform1f(locs.uSc,sc); gl.uniform1f(locs.uCx,cx); gl.uniform1f(locs.uFy,fy);
+      gl.uniform1f(locs.uXs,xs);
+      gl.uniform1f(locs.uCY,Math.cos(camY)); gl.uniform1f(locs.uSY,Math.sin(camY));
+      gl.uniform1f(locs.uCX,Math.cos(camX)); gl.uniform1f(locs.uSX,Math.sin(camX));
+      gl.uniform2f(locs.uVP,W,H);
+    }
+
+    function drawGrid(cx,fy,sc,xs,camY,camX){
+      gl.useProgram(gridProg);
+      applyProj(gU,cx,fy,sc,xs,camY,camX);
+      gl.bindBuffer(gl.ARRAY_BUFFER,gridBuf);
+      gl.vertexAttribPointer(gAPos,3,gl.FLOAT,false,0,0);
+      gl.enableVertexAttribArray(gAPos);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,null);
+      gl.drawArrays(gl.LINES,0,gridVerts.length/3);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf);
+    }
+
+    function glView(cx,fy,sc,xs,camY,camX,r,g,b){
+      gl.useProgram(prog);
+      gl.uniform1f(uLocs.uWX,_wx); gl.uniform1f(uLocs.uWS,_ws);
+      applyProj(uLocs,cx,fy,sc,xs,camY,camX);
+      gl.uniform4f(uLocs.uCol,r,g,b,1);
+      gl.bindBuffer(gl.ARRAY_BUFFER,vtxBufGL);
+      gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+      gl.enableVertexAttribArray(aPos);
+      gl.drawElements(gl.TRIANGLES,model.faceCount*3,gl.UNSIGNED_SHORT,0);
     }
 
     // ── 5. Render loop ──────────────────────────────────────────────────
-    let lastLm = null;
-    let smoothLm = null;   // EMA-smoothed landmarks — kills pose jitter
+    let lastImageLm = null;   // most-recent pose 2D landmarks (image-space)
+    let smoothImageLm = null;
+    let smoothWorldLm = null; // smoothed pose worldLandmarks
+    let smoothLeftHand = null, smoothRightHand = null;
+    let lastHandRes = null;   // reused on frames where hand detection is skipped
+    let handFrame = 0;        // counter for alternating-frame hand detection
     let lastTs = -1;
     let frameCount = 0, fpsTs = performance.now(), fps = 0;
 
-    // Pose landmark smoothing (separate from position smoothing)
-    const LM_S = 0.5;    // landmark EMA — responsive, light jitter damping
+    // EMA smoothing factors
+    const LM_S = 0.5;        // pose body — responsive, light jitter damping
+    const HAND_S = 0.6;      // hand — slightly more responsive (fingers move fast)
 
-    // Smoothed position/scale/twist
-    let sCx = W / 2, sScale = 280, sFootY = H * 0.88, sTwist = 0;
+    // Smoothed position/scale (image-space, for screen placement)
+    let sCx = W / 2, sScale = 280, sFootY = H * 0.88;
     const SMOOTH = 0.25;
+
+    // EMA smooth a landmark array (mutates `acc`, allocates first time only).
+    function smoothLandmarks(acc, fresh, alpha) {
+      if (!acc) return fresh.map(lm => ({ ...lm }));
+      for (let i = 0; i < fresh.length; i++) {
+        const a = acc[i], f = fresh[i];
+        a.x += (f.x - a.x) * alpha;
+        a.y += (f.y - a.y) * alpha;
+        a.z = (a.z ?? 0) + ((f.z ?? 0) - (a.z ?? 0)) * alpha;
+        a.visibility = (a.visibility ?? 1) + ((f.visibility ?? 1) - (a.visibility ?? 1)) * alpha;
+      }
+      return acc;
+    }
 
     let lastFrame = 0;
     function tick() {
       requestAnimationFrame(tick);
       const now = performance.now();
-      if (now - lastFrame < 16) return;  // cap at ~60fps max
+      if (now - lastFrame < 16) return;
       lastFrame = now;
 
-      // Run MediaPipe (VIDEO mode: only if timestamp advanced)
+      // ── Detect (VIDEO mode requires monotonically advancing timestamps) ──
+      // Pose every frame; hand every other frame — hand inference is ~half the
+      // total MediaPipe budget on integrated GPU, and finger motion at 15Hz
+      // looks fine after EMA smoothing.
       if (video.readyState >= 2 && now !== lastTs) {
         lastTs = now;
-        const result = landmarker.detectForVideo(video, now);
-        if (result.landmarks.length > 0) {
-          lastLm = result.landmarks[0];
-          // EMA smooth the raw landmarks to kill per-frame jitter
-          if (!smoothLm) {
-            smoothLm = lastLm.map(lm => ({...lm}));
-          } else {
-            for (let i = 0; i < lastLm.length; i++) {
-              smoothLm[i].x += (lastLm[i].x - smoothLm[i].x) * LM_S;
-              smoothLm[i].y += (lastLm[i].y - smoothLm[i].y) * LM_S;
-              smoothLm[i].z = (smoothLm[i].z ?? 0) + ((lastLm[i].z ?? 0) - (smoothLm[i].z ?? 0)) * LM_S;
-              smoothLm[i].visibility = (smoothLm[i].visibility ?? 1) + ((lastLm[i].visibility ?? 1) - (smoothLm[i].visibility ?? 1)) * LM_S;
-            }
-          }
+        const poseRes = poseLandmarker.detectForVideo(video, now);
+        if ((handFrame++ & 1) === 0) {
+          lastHandRes = handLandmarker.detectForVideo(video, now);
+        }
+
+        if (poseRes.landmarks.length > 0) {
+          lastImageLm   = poseRes.landmarks[0];
+          smoothImageLm = smoothLandmarks(smoothImageLm, lastImageLm, LM_S);
+          smoothWorldLm = smoothLandmarks(smoothWorldLm, poseRes.worldLandmarks[0], LM_S);
+
+          const hr = lastHandRes ?? { landmarks: [], worldLandmarks: [] };
+          const { leftHand: lH, rightHand: rH } = assignHands(
+            hr.landmarks, hr.worldLandmarks, smoothImageLm,
+          );
+          smoothLeftHand  = lH ? smoothLandmarks(smoothLeftHand,  lH, HAND_S) : null;
+          smoothRightHand = rH ? smoothLandmarks(smoothRightHand, rH, HAND_S) : null;
         }
       }
 
@@ -212,22 +296,26 @@
       ctx.fillStyle = "#0a0a0f";
       ctx.fillRect(0, 0, W, H);
 
-      if (!smoothLm) {
+      if (!smoothWorldLm) {
         ctx.fillStyle = "#555";
         ctx.font = "18px monospace";
         ctx.fillText("Stand in front of the camera…", W/2 - 160, H/2);
         return;
       }
 
-      // ── Pose: use smoothed landmarks to reduce jitter ──
+      // ── Pose deltas from world landmarks (+ hands) ──
       const t1 = performance.now();
-      const deltas = landmarksToPoseDeltas(smoothLm, model, boneIndex, /*mirrorX=*/false);
+      const deltas = landmarksToPoseDeltas({
+        pose:      smoothWorldLm,
+        leftHand:  smoothLeftHand  ?? undefined,
+        rightHand: smoothRightHand ?? undefined,
+      }, model, boneIndex);
       forwardKinematics(model, deltas, boneXforms);
       const mesh = lbs(model, boneXforms, vertBuf);
       const poseMs = (performance.now() - t1).toFixed(1);
 
-      // ── Scale from shoulder width; cx from shoulder midpoint (stable) ──
-      const lS = smoothLm[11], rS = smoothLm[12];
+      // ── Screen position from image-space pose ──
+      const lS = smoothImageLm[11], rS = smoothImageLm[12];
       const torsoW = Math.abs(lS.x - rS.x);
       const rawScale = torsoW > 0.02 ? (torsoW * W) / 0.42 : sScale;
       const shoulderY = ((lS.y + rS.y) / 2) * H;
@@ -238,33 +326,33 @@
       sScale += (clampedScale               - sScale) * SMOOTH;
       sFootY += (shoulderY + 1.35 * sScale  - sFootY) * SMOOTH;
 
-      // Hip twist
-      const lH = smoothLm[23], rH = smoothLm[24];
-      const hipDx = Math.abs(lH.x - rH.x) || 0.01;
-      const rawTwist = Math.atan2((lH.z ?? 0) - (rH.z ?? 0), hipDx) * 0.35;
-      sTwist += (rawTwist - sTwist) * SMOOTH;
-
       // ── WebGL: 4 views — 4 draw calls total ────────────────────────────
       const HW = W / 2, HH = H / 2;
       const vs = Math.min(sScale * 0.42, HH * 0.82 / 1.7);
-      const vt = sTwist;
       const bodyH = 1.7 * vs;
 
-      // Upload posed vertices to GPU (dynamic each frame)
+      // Upload posed vertices
       gl.bindBuffer(gl.ARRAY_BUFFER, vtxBufGL);
       gl.bufferSubData(gl.ARRAY_BUFFER, 0, mesh.vertices);
-      gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
-      gl.enableVertexAttribArray(aPos);
-      gl.uniform2f(uLocs.uVP, W, H);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
 
-      gl.clearColor(0.04, 0.04, 0.06, 1);
+      gl.clearColor(0.047, 0.047, 0.071, 1);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-      // CW winding = front face (matches Anny mesh + our culling convention)
-      glView(HW*0.5,  HH*0.1+bodyH,       vs,     -1, vt,                0,   0.29, 0.61, 1.0);  // FRONT blue
-      glView(HW*1.5,  HH*0.1+bodyH,       vs,     -1, Math.PI+vt,        0,   1.0,  0.55, 0.29); // BACK  orange
-      glView(HW*0.5,  HH+HH*0.1+bodyH,    vs,     -1, Math.PI*0.35+vt,   0,   0.29, 1.0,  0.54); // 3/4   green
-      glView(HW*1.5,  HH+HH*0.55,         vs*0.6,  1, vt,               0.9,  0.85, 0.29, 1.0);  // ABOVE purple
+      // Torso twist is now baked into spine01's rotation by the pose driver —
+      // no world rotation needed; cameras have fixed base angles.
+      setWorldTwist(0);
+      const bfo = minRestZ * vs;   // foot-level correction
+      const fT = HH*0.1+bodyH+bfo, fB = HH+HH*0.1+bodyH+bfo;
+
+      drawGrid(HW*0.5, HH*0.1+bodyH,     vs,      -1, 0,           0);
+      glView  (HW*0.5, fT,                vs,      -1, 0,           0,    0.88,0.90,0.95); // FRONT
+      drawGrid(HW*1.5, HH*0.1+bodyH,     vs,      -1, Math.PI,     0);
+      glView  (HW*1.5, fT,                vs,      -1, Math.PI,     0,    0.95,0.90,0.85); // BACK
+      drawGrid(HW*0.5, HH+HH*0.1+bodyH,  vs,      -1, Math.PI*0.35,0);
+      glView  (HW*0.5, fB,                vs,      -1, Math.PI*0.35,0,    0.88,0.95,0.90); // 3/4
+      drawGrid(HW*1.5, HH+HH*0.55,       vs*0.6,   1, 0,           0.85);
+      glView  (HW*1.5, HH+HH*0.55+bfo*0.6, vs*0.6, 1, 0,           0.85, 0.92,0.88,0.96); // ABOVE
 
       // ── 2D canvas: background + dividers + labels only ────────────────
       ctx.fillStyle = "transparent";
@@ -286,16 +374,16 @@
       label("3/4",   0, HH); label("ABOVE", HW, HH);
 
       // ── Overlay: mini landmark skeleton (for debugging) ──
-      const LW = 160, LH = 120;  // landmark preview size
+      const LW = 160, LH = 120;
       ctx.save();
       ctx.globalAlpha = 0.5;
-      ctx.strokeStyle = "#0f0";
       ctx.lineWidth = 1.5;
-      const lx = (i) => 8 + lastLm[i].x * LW;
-      const ly = (i) => 8 + lastLm[i].y * LH;
+      const lx = (i) => 8 + lastImageLm[i].x * LW;
+      const ly = (i) => 8 + lastImageLm[i].y * LH;
       const bone = (a, b) => {
         ctx.beginPath(); ctx.moveTo(lx(a), ly(a)); ctx.lineTo(lx(b), ly(b)); ctx.stroke();
       };
+      ctx.strokeStyle = "#0f0";
       // torso
       bone(11,12); bone(11,23); bone(12,24); bone(23,24);
       // arms
@@ -308,7 +396,8 @@
       // ── Stats ──
       ctx.fillStyle = "#4f4";
       ctx.font = "12px monospace";
-      ctx.fillText(`FK+LBS ${poseMs} ms   ${fps} fps`, 10, H - 10);
+      const hands = (smoothLeftHand ? "L" : "-") + (smoothRightHand ? "R" : "-");
+      ctx.fillText(`FK+LBS ${poseMs} ms   ${fps} fps   hands:${hands}`, 10, H - 10);
     }
 
     tick();

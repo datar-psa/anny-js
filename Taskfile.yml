@@ -128,10 +128,16 @@ tasks:
     desc: "Deploy to anny-js.clad.you (Firebase Hosting under clad-main)"
     deps: [build]
     cmds:
-      - firebase deploy --only hosting:{{.PKG_NAME}} --project {{.FIREBASE_PROJECT}}
+      - bunx firebase deploy --only hosting:{{.PKG_NAME}} --project {{.FIREBASE_PROJECT}}
 
   deploy:init:
-    desc: "First-time setup — create anny-js site under clad-main, then add custom domain anny-js.clad.you in Firebase console"
+    desc: "First-time setup — create anny-js site under clad-main, wire custom domain"
     cmds:
-      - firebase hosting:sites:create {{.PKG_NAME}} --project {{.FIREBASE_PROJECT}} || true
-      - echo "→ Add custom domain anny-js.clad.you in Firebase console → Hosting → anny-js site"
+      - bunx firebase hosting:sites:create {{.PKG_NAME}} --project {{.FIREBASE_PROJECT}} || true
+      - |
+        echo ""
+        echo "DNS record (add to clad.you zone):"
+        echo "  CNAME  anny-js.clad.you  →  anny-js.web.app"
+        echo ""
+        echo "Then in Firebase console → Hosting → anny-js site → Add custom domain:"
+        echo "  anny-js.clad.you"

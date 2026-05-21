@@ -20,7 +20,9 @@
       { "source": "/",                  "destination": "/demo/anim.html" },
       { "source": "/demo",              "destination": "/demo/anim.html" },
       { "source": "/demo/mediapipe",    "destination": "/demo/live.html" },
-      { "source": "/live",              "destination": "/demo/live.html" }
+      { "source": "/live",              "destination": "/demo/live.html" },
+      { "source": "/demo/video",        "destination": "/demo/video.html" },
+      { "source": "/video",             "destination": "/demo/video.html" }
     ]
   }
 }

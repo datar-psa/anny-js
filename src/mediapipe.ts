@@ -33,9 +33,9 @@
  *   chain accumulation.
  *
  * • Coordinate conversion (MP world ↔ Anny world):
- *       MP world:  +x = subject's anatomical right, +y = down,    +z = away from camera
- *       Anny:      +x = subject's anatomical left,  +y = depth back, +z = up
- *     ⇒  anny = [-mp.x, +mp.z, -mp.y]
+ *       MP world:  +x = subject's anatomical left, +y = down,        +z = away from camera
+ *       Anny:      +x = subject's anatomical left, +y = depth (back), +z = up
+ *     ⇒  anny = [+mp.x, +mp.z, -mp.y]
  */
 
 import { cross, normalize3, rodriguesToMat3 } from "./math.js";
@@ -170,12 +170,12 @@ function clampedRotFromTo(from: Float32Array, to: Float32Array, maxAngle: number
 /**
  * Convert a MediaPipe world landmark to Anny world coordinates.
  *
- *   MP world:  +x = subject's anatomical left, +y = down,        +z = away from camera
- *   Anny:      +x = subject's anatomical left, +y = depth (back), +z = up
+ *   MP world:  +x = anatomical left, +y = down, +z = away from camera (subject's back)
+ *   Anny:      +x = anatomical left, +y = depth (back), +z = up
  *
- * (MP world matches the 2D image-landmark convention: subject's anatomical
- * left appears at large image-x because the camera doesn't mirror, so MP
- * world +x is on the same side as image +x.)
+ * The MP worldLandmarks z follows the same convention as image landmarks
+ * (smaller z = closer to camera, i.e. positive z = away from camera =
+ * subject's back direction in world). So Anny.y = +mp.z aligns naturally.
  *
  * `mirrorX` flips x after conversion — only set true if upstream already
  * mirrored the landmarks. Default false (standard MediaPipe output).
@@ -229,6 +229,112 @@ function midpoint(a: Float32Array, b: Float32Array): Float32Array {
   return new Float32Array([(a[0]+b[0])*0.5, (a[1]+b[1])*0.5, (a[2]+b[2])*0.5]);
 }
 
+/**
+ * Drive the `root` bone from the dancer's hip frame, rotating the WHOLE rig
+ * (pelvis + legs + spine chain) to match the subject's body orientation.
+ *
+ * Why this is needed: driving only spine03 rotates the upper torso but leaves
+ * pelvis.L/R (parents of the leg chains) at rest, so a sideways-facing dancer
+ * gets a 90° kink at the lumbar with hips still facing forward.
+ *
+ * Why this is subtle: `root` has its OWN rest-frame convention, different
+ * from spine03's. Inspecting `restBonePoses["root"]` (Anny v1):
+ *   local_X → world (+1, 0, 0)             — anatomical-left ✓
+ *   local_Y → world (0, -0.93, +0.37)      — forward (slightly up)
+ *   local_Z → world (0, -0.37, -0.93)      — down (slightly forward)
+ *
+ * i.e. for the root bone, local-Y is "forward of body" (not "up along spine"
+ * like the spine bones), and there's a built-in ~22° pitch in the rest pose.
+ * If we naïvely set worldR = (x_left, y_up, z_chest) — the spine convention —
+ * the body gets a 90° pitch backward at rest, manifesting as Anny crumpled
+ * forward. This was the visible regression.
+ *
+ * Correct math: we want root's world rotation to equal `rest_R[root]` when
+ * the dancer is in the canonical rest orientation, and to rotate together
+ * with the dancer's hip frame otherwise:
+ *
+ *   worldR = dancer_anatomical_frame · inv(rest_anatomical_frame) · rest_R[root]
+ *
+ * where `dancer_anatomical_frame` and `rest_anatomical_frame` are 3×3
+ * matrices with columns [anatomical-left, up-along-spine, out-of-chest], in
+ * Anny world coords. The middle factor is a constant: the rest anatomical
+ * frame is fixed by Anny world convention ((+x, +z, -y) for those three
+ * axes), so its inverse is a known matrix.
+ */
+function buildRootTarget(
+  ctx: TargetCtx,
+  out: Map<string, BoneTarget>,
+  model: AnnyModel,
+  boneIndex: Map<string, number>,
+): void {
+  if (!pairVisible(ctx, MP.LEFT_SHOULDER, MP.RIGHT_SHOULDER) ||
+      !pairVisible(ctx, MP.LEFT_HIP, MP.RIGHT_HIP)) return;
+
+  const rootIdx = boneIndex.get("root");
+  if (rootIdx === undefined) return;
+
+  const ls = new Float32Array(poseAt(ctx, MP.LEFT_SHOULDER));
+  const rs = new Float32Array(poseAt(ctx, MP.RIGHT_SHOULDER));
+  const lh = new Float32Array(poseAt(ctx, MP.LEFT_HIP));
+  const rh = new Float32Array(poseAt(ctx, MP.RIGHT_HIP));
+
+  // Hip frame (NOT shoulder frame) — this is what makes the root track hips
+  // independently from any upper-body twist that spine03 will handle.
+  const shdMid = midpoint(ls, rs);
+  const hipMid = midpoint(lh, rh);
+  const yUp = normSub(shdMid, hipMid);   // up along spine
+  const xRaw = normSub(lh, rh);          // anatomical-left across HIPS
+  const dxy = xRaw[0]*yUp[0] + xRaw[1]*yUp[1] + xRaw[2]*yUp[2];
+  const xL = normalize3(new Float32Array([
+    xRaw[0] - dxy*yUp[0], xRaw[1] - dxy*yUp[1], xRaw[2] - dxy*yUp[2],
+  ]));
+  const zF = normalize3(cross(xL, yUp));  // out-of-chest
+
+  // dancer_anatomical_frame (row-major 3×3, columns = [xL, yUp, zF]).
+  // Indices labelled [r,c] for clarity.
+  const D = new Float32Array(9);
+  D[0]=xL[0]; D[1]=yUp[0]; D[2]=zF[0];
+  D[3]=xL[1]; D[4]=yUp[1]; D[5]=zF[1];
+  D[6]=xL[2]; D[7]=yUp[2]; D[8]=zF[2];
+
+  // inv(rest_anatomical_frame): Anny rest pose has anatomical-left = world +x,
+  // up = world +z, out-of-chest = world -y. So rest_anatomical_frame as cols
+  // is [(1,0,0), (0,0,1), (0,-1,0)]; its inverse (transpose, since orthogonal)
+  // is row-major [1,0,0; 0,0,1; 0,-1,0].
+  const INV_REST_ANAT = new Float32Array([
+    1, 0, 0,
+    0, 0, 1,
+    0, -1, 0,
+  ]);
+
+  // rest_R[root]: pull the 3×3 from model.restBonePoses[root].
+  const restRroot = new Float32Array(9);
+  extractRestRot3(model.restBonePoses, rootIdx, restRroot, 0);
+
+  // worldR = D · INV_REST_ANAT · restRroot
+  const tmp = new Float32Array(9);
+  mul3(D, INV_REST_ANAT, tmp);
+  const worldR = new Float32Array(9);
+  mul3(tmp, restRroot, worldR);
+
+  out.set("root", { kind: "rot", worldR });
+}
+
+/** Multiply two row-major 3×3 matrices: out = A · B. */
+function mul3(A: Float32Array, B: Float32Array, out: Float32Array): void {
+  const a0=A[0],a1=A[1],a2=A[2],a3=A[3],a4=A[4],a5=A[5],a6=A[6],a7=A[7],a8=A[8];
+  const b0=B[0],b1=B[1],b2=B[2],b3=B[3],b4=B[4],b5=B[5],b6=B[6],b7=B[7],b8=B[8];
+  out[0] = a0*b0 + a1*b3 + a2*b6;
+  out[1] = a0*b1 + a1*b4 + a2*b7;
+  out[2] = a0*b2 + a1*b5 + a2*b8;
+  out[3] = a3*b0 + a4*b3 + a5*b6;
+  out[4] = a3*b1 + a4*b4 + a5*b7;
+  out[5] = a3*b2 + a4*b5 + a5*b8;
+  out[6] = a6*b0 + a7*b3 + a8*b6;
+  out[7] = a6*b1 + a7*b4 + a8*b7;
+  out[8] = a6*b2 + a7*b5 + a8*b8;
+}
+
 function buildBodyTargets(ctx: TargetCtx, out: Map<string, BoneTarget>): void {
   // ── spine03: full rotation frame (torso bend + twist around vertical) ──
   // Driving the topmost spine bone (spine01) creates a hinge just below the
@@ -277,27 +383,46 @@ function buildBodyTargets(ctx: TargetCtx, out: Map<string, BoneTarget>): void {
     out.set("neck01", { kind: "dir", worldY: normSub(midpoint(le, re), midpoint(ls, rs)) });
   }
 
-  // ── head: full rotation frame from ears + nose ──
+  // ── head: full rotation frame from ears + eyes + mouth ──
   // Anny's `head` bone has local X = anatomical-left, Y = up through skull,
-  // Z = forward out of face. Driving it as a Y-direction target would force
-  // "up" to align with "nose direction" → tilts the head 90° to look at the
-  // floor. Build the proper frame instead.
-  if (visible(ctx.pose[MP.NOSE], ctx.visMin) &&
-      pairVisible(ctx, MP.LEFT_EAR, MP.RIGHT_EAR)) {
+  // Z = forward out of face.
+  //
+  // Building Y from "ear-to-nose" (the obvious-sounding choice) is wrong:
+  // the nose sits BELOW ear level on a real face, so that vector points
+  // down-and-forward and the head ends up tilted forward (chin to chest)
+  // even when the subject looks straight ahead.
+  //
+  // The eyes (above) and mouth (below) give a clean face-vertical axis,
+  // independent of skull anatomy. Eye→mouth points down in face frame, so
+  // Y_face = eyeMid - mouthMid points up. Then Z = cross(X, Y) gives the
+  // face-forward direction, free of the nose's vertical offset.
+  if (pairVisible(ctx, MP.LEFT_EAR, MP.RIGHT_EAR) &&
+      pairVisible(ctx, MP.LEFT_EYE, MP.RIGHT_EYE) &&
+      pairVisible(ctx, MP.MOUTH_LEFT, MP.MOUTH_RIGHT)) {
     const le = new Float32Array(poseAt(ctx, MP.LEFT_EAR));
     const re = new Float32Array(poseAt(ctx, MP.RIGHT_EAR));
-    const ns = new Float32Array(poseAt(ctx, MP.NOSE));
-    const earMid = midpoint(le, re);
+    const lEye = new Float32Array(poseAt(ctx, MP.LEFT_EYE));
+    const rEye = new Float32Array(poseAt(ctx, MP.RIGHT_EYE));
+    const lMth = new Float32Array(poseAt(ctx, MP.MOUTH_LEFT));
+    const rMth = new Float32Array(poseAt(ctx, MP.MOUTH_RIGHT));
+
     // X = anatomical-left across the head
     const x = normSub(le, re);
-    // Z (forward, out of face) = (nose - earMid) projected ⊥ X
-    const zRaw = new Float32Array([ns[0]-earMid[0], ns[1]-earMid[1], ns[2]-earMid[2]]);
-    const dzx = zRaw[0]*x[0] + zRaw[1]*x[1] + zRaw[2]*x[2];
-    const z = normalize3(new Float32Array([
-      zRaw[0] - dzx*x[0], zRaw[1] - dzx*x[1], zRaw[2] - dzx*x[2],
+    // yRaw = up through face (mouth → eyes)
+    const eyeMid = midpoint(lEye, rEye);
+    const mouthMid = midpoint(lMth, rMth);
+    const yRaw = new Float32Array([
+      eyeMid[0] - mouthMid[0],
+      eyeMid[1] - mouthMid[1],
+      eyeMid[2] - mouthMid[2],
+    ]);
+    // Orthogonalise Y against X (head-roll is encoded in X already)
+    const dyx = yRaw[0]*x[0] + yRaw[1]*x[1] + yRaw[2]*x[2];
+    const y = normalize3(new Float32Array([
+      yRaw[0] - dyx*x[0], yRaw[1] - dyx*x[1], yRaw[2] - dyx*x[2],
     ]));
-    // Y = Z × X (right-hand rule completes the frame; encodes chin-up/down)
-    const y = normalize3(cross(z, x));
+    // Z = X × Y completes the right-handed frame; encodes chin-up/down + yaw
+    const z = normalize3(cross(x, y));
     const worldR = new Float32Array([
       x[0], y[0], z[0],
       x[1], y[1], z[1],
@@ -311,7 +436,7 @@ function buildBodyTargets(ctx: TargetCtx, out: Map<string, BoneTarget>): void {
   arm(ctx, out, "R", MP.RIGHT_SHOULDER, MP.RIGHT_ELBOW, MP.RIGHT_WRIST, MP.RIGHT_INDEX);
 
   // ── Legs ──
-  leg(ctx, out, "L", MP.LEFT_HIP, MP.LEFT_KNEE, MP.LEFT_ANKLE, MP.LEFT_FOOT_INDEX);
+  leg(ctx, out, "L", MP.LEFT_HIP,  MP.LEFT_KNEE,  MP.LEFT_ANKLE,  MP.LEFT_FOOT_INDEX);
   leg(ctx, out, "R", MP.RIGHT_HIP, MP.RIGHT_KNEE, MP.RIGHT_ANKLE, MP.RIGHT_FOOT_INDEX);
 }
 
@@ -537,6 +662,7 @@ export function landmarksToPoseDeltas(
   // 1. Collect named targets from body + hands.
   const named = new Map<string, BoneTarget>();
   buildBodyTargets(ctx, named);
+  buildRootTarget(ctx, named, model, boneIndex);
   if (leftHand)  buildHandTargets(leftHand,  "L", mirrorX, named);
   if (rightHand) buildHandTargets(rightHand, "R", mirrorX, named);
 

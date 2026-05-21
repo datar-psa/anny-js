@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>anny-js — video pose demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0a0a0f; overflow: hidden; color: #ccc; font: 13px monospace; }
+    #status { position: fixed; top: 6px; left: 50%; transform: translateX(-50%); color: #0f0; z-index: 10; }
+    #picker { position: fixed; top: 6px; left: 12px; z-index: 20; display: flex; gap: 6px; }
+    #picker button {
+      background: #1a1a24; color: #ccc; border: 1px solid #333; border-radius: 4px;
+      padding: 5px 10px; font: 12px monospace; cursor: pointer;
+    }
+    #picker button.active { background: #2a3a4a; color: #fff; border-color: #4af; }
+    #picker button:hover { border-color: #4af; }
+    #src { position: fixed; top: 0; left: 0; width: 320px; height: 240px; opacity: 0.6; z-index: 3; object-fit: contain; background: #000; }
+    #gl  { position: fixed; top: 0; left: 0; z-index: 1; pointer-events: none; }
+    #c   { position: fixed; top: 0; left: 0; z-index: 2; pointer-events: none; background: transparent; }
+  </style>
+</head>
+<body>
+  <div id="status">Initialising…</div>
+  <div id="picker">
+    <button data-src="fixtures/boxer.mp4"  data-label="boxer"  class="active">🥊 boxer</button>
+    <button data-src="fixtures/dancer.mp4" data-label="dancer">💃 dancer</button>
+  </div>
+  <video id="src" autoplay muted loop playsinline crossorigin="anonymous"></video>
+  <canvas id="gl"></canvas>
+  <canvas id="c"></canvas>
+
+  <script type="module">
+    import { PoseLandmarker, HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+    import {
+      loadAnnyModel,
+      forwardKinematics, allocBoneTransforms,
+      lbs, allocVertexBuffer,
+      buildBoneIndex, landmarksToPoseDeltas, assignHands,
+    } from "../dist/index.js";
+
+    const W = window.innerWidth, H = window.innerHeight;
+    const canvas = document.getElementById("c");
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext("2d");
+    const video = document.getElementById("src");
+    const statusEl = document.getElementById("status");
+
+    // ── 1. Load Anny model ──────────────────────────────────────────────
+    const t0 = performance.now();
+    const model = await loadAnnyModel("../assets/anny_model.json", "../assets/anny_model.bin");
+    statusEl.textContent = `Anny loaded ${(performance.now()-t0).toFixed(0)} ms — starting MediaPipe…`;
+
+    const boneIndex    = buildBoneIndex(model);
+    const boneXforms   = allocBoneTransforms(model.boneCount);
+    const vertBuf      = allocVertexBuffer(model);
+
+    let minRestZ = 0;
+    for (let i = 2; i < model.restVertices.length; i += 3)
+      if (model.restVertices[i] < minRestZ) minRestZ = model.restVertices[i];
+
+    // ── 2. MediaPipe Pose + Hand landmarkers ───────────────────────────
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    const [poseLandmarker, handLandmarker] = await Promise.all([
+      PoseLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task",
+          delegate: "GPU",
+        },
+        runningMode: "VIDEO",
+        numPoses: 1,
+      }),
+      HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU",
+        },
+        runningMode: "VIDEO",
+        numHands: 2,
+      }),
+    ]);
+    statusEl.textContent = "MediaPipe ready — loading video…";
+
+    // ── 3. Video source + fixture picker ────────────────────────────────
+    // Smoothed pose/hand state — declared here so loadFixture() can reset them.
+    let lastImageLm = null;
+    let smoothImageLm = null;
+    let smoothWorldLm = null;
+    let smoothLeftHand = null, smoothRightHand = null;
+    let lastHandRes = null;
+
+    const picker = document.getElementById("picker");
+    async function loadFixture(src, label) {
+      // Reset smoothed state so a new clip doesn't blend in from the old one.
+      smoothImageLm = null;
+      smoothWorldLm = null;
+      smoothLeftHand = null;
+      smoothRightHand = null;
+      lastImageLm = null;
+      lastHandRes = null;
+
+      video.src = src;
+      await new Promise(r => video.addEventListener("loadeddata", r, { once: true }));
+      try { await video.play(); } catch {}
+      statusEl.textContent = `✓ Playing — ${label} (${video.videoWidth}×${video.videoHeight})`;
+    }
+
+    for (const btn of picker.querySelectorAll("button")) {
+      btn.addEventListener("click", async () => {
+        for (const b of picker.querySelectorAll("button")) b.classList.remove("active");
+        btn.classList.add("active");
+        await loadFixture(btn.dataset.src, btn.dataset.label);
+      });
+    }
+    await loadFixture("fixtures/boxer.mp4", "boxer");
+
+    // ── 4. WebGL setup ─────────────────────────────────────────────────
+    const glCanvas = document.getElementById("gl");
+    glCanvas.width = W; glCanvas.height = H;
+    const gl = glCanvas.getContext("webgl", { alpha: true, antialias: true, depth: true });
+
+    const dbgExt = gl.getExtension("WEBGL_debug_renderer_info");
+    const gpuName = dbgExt ? gl.getParameter(dbgExt.UNMASKED_RENDERER_WEBGL) : "unknown";
+    console.log("[GPU]", gpuName);
+
+    const compile = (type, src) => {
+      const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+        console.error("Shader compile error:", gl.getShaderInfoLog(s));
+      return s;
+    };
+
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, `
+      attribute vec3 aPos;
+      uniform float uSc,uCx,uFy,uXs,uCY,uSY,uCX,uSX,uWX,uWS;
+      uniform vec2 uVP;
+      varying vec3 vViewPos;
+      varying float vH,vD;
+      void main(){
+        float py=aPos.y*uWX-aPos.z*uWS, pz=aPos.y*uWS+aPos.z*uWX;
+        float rx=aPos.x*uCY-py*uSY, ry=aPos.x*uSY+py*uCY;
+        float rz=ry*uSX+pz*uCX, rd=ry*uCX-pz*uSX;
+        float sx=uCx+uXs*rx*uSc, sy=uFy-rz*uSc;
+        vViewPos=vec3(sx,sy,rd*uSc); vH=pz; vD=rd;
+        gl_Position=vec4(sx/uVP.x*2.-1.,1.-sy/uVP.y*2.,rd/5.,1.);
+      }`));
+    const hasD = !!gl.getExtension("OES_standard_derivatives");
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, hasD ? `
+      #extension GL_OES_standard_derivatives : enable
+      precision mediump float;
+      uniform vec4 uCol;
+      varying vec3 vViewPos; varying float vH,vD;
+      void main(){
+        vec3 n=normalize(cross(dFdx(vViewPos),dFdy(vViewPos)));
+        float key =max(dot(n,normalize(vec3( 0.3,-0.8, 0.6))),0.);
+        float fill=max(dot(n,normalize(vec3( 0.8, 0.2, 0.3))),0.);
+        float rim =max(dot(n,normalize(vec3(-0.2, 0.6,-0.8))),0.);
+        gl_FragColor=vec4(uCol.rgb*(0.28+0.52*key+0.14*fill+0.06*rim*rim),1.);
+      }` : `
+      precision mediump float;
+      uniform vec4 uCol; varying float vH,vD;
+      void main(){
+        float t=0.35+0.65*clamp(vH/1.8,0.,1.);
+        float f=0.50+0.50*clamp(-vD*1.4,0.,1.);
+        gl_FragColor=vec4(uCol.rgb*(t*.5+f*.5),1.);
+      }`));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+      console.error("Body shader link error:", gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+
+    const aPos = gl.getAttribLocation(prog, "aPos");
+    const uLocs = {};
+    for (const n of ["uSc","uCx","uFy","uXs","uCY","uSY","uCX","uSX","uWX","uWS","uVP","uCol"])
+      uLocs[n] = gl.getUniformLocation(prog, n);
+
+    const gridProg = gl.createProgram();
+    gl.attachShader(gridProg, compile(gl.VERTEX_SHADER, `
+      attribute vec3 aPos;
+      uniform float uSc,uCx,uFy,uXs,uCY,uSY,uCX,uSX; uniform vec2 uVP;
+      void main(){
+        float rx=aPos.x*uCY-aPos.y*uSY, ry=aPos.x*uSY+aPos.y*uCY;
+        float rz=ry*uSX+aPos.z*uCX, rd=ry*uCX-aPos.z*uSX;
+        gl_Position=vec4((uCx+uXs*rx*uSc)/uVP.x*2.-1.,1.-(uFy-rz*uSc)/uVP.y*2.,rd/5.+.001,1.);
+      }`));
+    gl.attachShader(gridProg, compile(gl.FRAGMENT_SHADER,
+      "precision mediump float; void main(){gl_FragColor=vec4(.28,.28,.34,.5);}"));
+    gl.linkProgram(gridProg);
+    const gAPos = gl.getAttribLocation(gridProg, "aPos");
+    const gU = {};
+    for (const n of ["uSc","uCx","uFy","uXs","uCY","uSY","uCX","uSX","uVP"])
+      gU[n] = gl.getUniformLocation(gridProg, n);
+
+    const gridVerts = []; const gr = 1.4, gs = gr*2/20;
+    for (let i = 0; i <= 20; i++){
+      const v = -gr+i*gs;
+      gridVerts.push(v,-gr,0, v,gr,0, -gr,v,0, gr,v,0);
+    }
+    const gridBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, gridBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(gridVerts), gl.STATIC_DRAW);
+
+    const idxBuf = gl.createBuffer();
+    const faces16 = new Uint16Array(model.faces.length);
+    for (let i = 0; i < model.faces.length; i++) faces16[i] = model.faces[i];
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, faces16, gl.STATIC_DRAW);
+
+    const vtxBufGL = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vtxBufGL);
+    gl.bufferData(gl.ARRAY_BUFFER, model.vertCount * 12, gl.DYNAMIC_DRAW);
+
+    gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE);
+    gl.cullFace(gl.BACK); gl.frontFace(gl.CCW);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    let _wx=1, _ws=0;
+    function setWorldTwist(a){ _wx=Math.cos(a); _ws=Math.sin(a); }
+
+    function applyProj(locs, cx,fy,sc,xs,camY,camX){
+      gl.uniform1f(locs.uSc,sc); gl.uniform1f(locs.uCx,cx); gl.uniform1f(locs.uFy,fy);
+      gl.uniform1f(locs.uXs,xs);
+      gl.uniform1f(locs.uCY,Math.cos(camY)); gl.uniform1f(locs.uSY,Math.sin(camY));
+      gl.uniform1f(locs.uCX,Math.cos(camX)); gl.uniform1f(locs.uSX,Math.sin(camX));
+      gl.uniform2f(locs.uVP,W,H);
+    }
+
+    function drawGrid(cx,fy,sc,xs,camY,camX){
+      gl.useProgram(gridProg);
+      applyProj(gU,cx,fy,sc,xs,camY,camX);
+      gl.bindBuffer(gl.ARRAY_BUFFER,gridBuf);
+      gl.vertexAttribPointer(gAPos,3,gl.FLOAT,false,0,0);
+      gl.enableVertexAttribArray(gAPos);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,null);
+      gl.drawArrays(gl.LINES,0,gridVerts.length/3);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf);
+    }
+
+    function glView(cx,fy,sc,xs,camY,camX,r,g,b){
+      gl.useProgram(prog);
+      gl.uniform1f(uLocs.uWX,_wx); gl.uniform1f(uLocs.uWS,_ws);
+      applyProj(uLocs,cx,fy,sc,xs,camY,camX);
+      gl.uniform4f(uLocs.uCol,r,g,b,1);
+      gl.bindBuffer(gl.ARRAY_BUFFER,vtxBufGL);
+      gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+      gl.enableVertexAttribArray(aPos);
+      gl.drawElements(gl.TRIANGLES,model.faceCount*3,gl.UNSIGNED_SHORT,0);
+    }
+
+    // ── 5. Render loop ──────────────────────────────────────────────────
+    // (lastImageLm/smoothImageLm/smoothWorldLm/smoothLeftHand/smoothRightHand/lastHandRes
+    //  declared earlier so loadFixture can reset them.)
+    let handFrame = 0;
+    let lastTs = -1;
+    let frameCount = 0, fpsTs = performance.now(), fps = 0;
+
+    const LM_S = 0.5;
+    const HAND_S = 0.6;
+
+    let sCx = W / 2, sScale = 280, sFootY = H * 0.88;
+    const SMOOTH = 0.25;
+
+    function smoothLandmarks(acc, fresh, alpha) {
+      if (!acc) return fresh.map(lm => ({ ...lm }));
+      for (let i = 0; i < fresh.length; i++) {
+        const a = acc[i], f = fresh[i];
+        a.x += (f.x - a.x) * alpha;
+        a.y += (f.y - a.y) * alpha;
+        a.z = (a.z ?? 0) + ((f.z ?? 0) - (a.z ?? 0)) * alpha;
+        a.visibility = (a.visibility ?? 1) + ((f.visibility ?? 1) - (a.visibility ?? 1)) * alpha;
+      }
+      return acc;
+    }
+
+    // ── Numeric pose verifier ───────────────────────────────────────────
+    // Compares each driven bone's posed local Y axis in world (= what the
+    // driver actually sets) against the MediaPipe-derived expected direction.
+    // Small angular error per segment = the driver did its job.
+    //
+    // Important: we compare bone AXES, not bone-head positions. The driver
+    // controls rotations; bone-head positions also depend on rig geometry
+    // (twist bones, joint-center conventions) that the driver can't change.
+    // Comparing positions leaks ~5-10° of rest-pose bias into every limb row
+    // and hides the real per-bone error.
+    function numericVerify() {
+      if (!smoothWorldLm) return { error: "no pose data yet" };
+
+      // Extract a posed axis in world: world_axis = boneXforms_R · rest_R_col.
+      // boneXforms = pose @ inv(rest), so boneXforms_R @ rest_R_col = pose_R @ e_i.
+      // colIdx: 0=local X, 1=local Y, 2=local Z.
+      function boneAxisWorld(name, colIdx) {
+        const i = boneIndex.get(name);
+        if (i === undefined) return null;
+        const x = boneXforms,         o = i * 16;
+        const r = model.restBonePoses, p = i * 16;
+        // rest row-major: col 0 = (r[0], r[4], r[8]); col 1 = (r[1], r[5], r[9]); col 2 = (r[2], r[6], r[10]).
+        const c0 = colIdx, c1 = colIdx + 4, c2 = colIdx + 8;
+        const ax = r[p + c0], ay = r[p + c1], az = r[p + c2];
+        const out = [
+          x[o + 0]*ax + x[o + 1]*ay + x[o + 2]*az,
+          x[o + 4]*ax + x[o + 5]*ay + x[o + 6]*az,
+          x[o + 8]*ax + x[o + 9]*ay + x[o +10]*az,
+        ];
+        const L = Math.hypot(out[0], out[1], out[2]) || 1;
+        return [out[0]/L, out[1]/L, out[2]/L];
+      }
+      const boneY = (n) => boneAxisWorld(n, 1);
+      const boneX = (n) => boneAxisWorld(n, 0);
+
+      function normSub(a, b) {
+        const v = [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+        const L = Math.hypot(v[0], v[1], v[2]) || 1;
+        return [v[0]/L, v[1]/L, v[2]/L];
+      }
+      function midpt(a, b) { return [(a[0]+b[0])/2, (a[1]+b[1])/2, (a[2]+b[2])/2]; }
+      // MP → Anny coord conversion: matches lib's mpToAnny — anny = (mp.x, mp.z, -mp.y).
+      function mp2anny(lm) { return [lm.x, lm.z, -lm.y]; }
+      function angle(u, v) {
+        const d = u[0]*v[0] + u[1]*v[1] + u[2]*v[2];
+        return Math.acos(Math.max(-1, Math.min(1, d))) * 180 / Math.PI;
+      }
+
+      const M = {
+        LSH: 11, RSH: 12, LEL: 13, REL: 14, LWR: 15, RWR: 16,
+        LHIP: 23, RHIP: 24, LKN: 25, RKN: 26, LAN: 27, RAN: 28,
+      };
+      const mpA = Object.fromEntries(
+        Object.entries(M).map(([k, i]) => [k, mp2anny(smoothWorldLm[i])]),
+      );
+
+      // Each row: [label, expected_dir_from_MP, bone_axis_we_drive].
+      // Limb bones get a 'dir' target that aligns the bone's local Y to the
+      // shoulder→elbow / elbow→wrist / hip→knee / knee→ankle direction.
+      const segs = [
+        ["L_upperarm", normSub(mpA.LEL,  mpA.LSH),  boneY("upperarm01.L")],
+        ["L_lowerarm", normSub(mpA.LWR,  mpA.LEL),  boneY("lowerarm01.L")],
+        ["R_upperarm", normSub(mpA.REL,  mpA.RSH),  boneY("upperarm01.R")],
+        ["R_lowerarm", normSub(mpA.RWR,  mpA.REL),  boneY("lowerarm01.R")],
+        ["L_upperleg", normSub(mpA.LKN,  mpA.LHIP), boneY("upperleg01.L")],
+        ["L_lowerleg", normSub(mpA.LAN,  mpA.LKN),  boneY("lowerleg01.L")],
+        ["R_upperleg", normSub(mpA.RKN,  mpA.RHIP), boneY("upperleg01.R")],
+        ["R_lowerleg", normSub(mpA.RAN,  mpA.RKN),  boneY("lowerleg01.R")],
+      ];
+
+      // hip_axis: root is driven with a full 'rot' target. Its local X axis
+      // should point along the dancer's anatomical-left direction.
+      const rootX = boneX("root");
+      if (rootX) segs.push(["hip_axis  ", normSub(mpA.LHIP, mpA.RHIP), rootX]);
+
+      // spine: spine03 is driven with a 'rot' target. Its local Y axis should
+      // point along the dancer's hip-mid → shoulder-mid line.
+      const spineDir = normSub(midpt(mpA.LSH, mpA.RSH), midpt(mpA.LHIP, mpA.RHIP));
+      const spineY   = boneY("spine03");
+      if (spineY) segs.push(["spine     ", spineDir, spineY]);
+
+      const rows = [];
+      let sumErr = 0;
+      for (const [name, mpDir, annyDir] of segs) {
+        if (!annyDir) { rows.push({ seg: name, err: "n/a" }); continue; }
+        const errDeg = angle(mpDir, annyDir);
+        rows.push({
+          seg: name,
+          err_deg: +errDeg.toFixed(1),
+          mp_dir:   mpDir.map(v => +v.toFixed(3)),
+          anny_dir: annyDir.map(v => +v.toFixed(3)),
+        });
+        sumErr += errDeg;
+      }
+      return { mean_err_deg: +(sumErr / segs.length).toFixed(1), segments: rows };
+    }
+
+    let lastFrame = 0;
+    function tick() {
+      requestAnimationFrame(tick);
+      const now = performance.now();
+      if (now - lastFrame < 16) return;
+      lastFrame = now;
+
+      // Expose model + bone buffers for the numeric verifier (__verifyPose).
+      if (!window.__verifyPose) {
+        window.__model = model;
+        window.__boneIndex = boneIndex;
+        window.__boneXforms = boneXforms;
+        window.__verifyPose = numericVerify;
+      }
+
+      if (video.readyState >= 2 && now !== lastTs) {
+        lastTs = now;
+        const poseRes = poseLandmarker.detectForVideo(video, now);
+        if ((handFrame++ & 1) === 0) {
+          lastHandRes = handLandmarker.detectForVideo(video, now);
+        }
+
+        if (poseRes.landmarks.length > 0) {
+          lastImageLm   = poseRes.landmarks[0];
+          smoothImageLm = smoothLandmarks(smoothImageLm, lastImageLm, LM_S);
+          smoothWorldLm = smoothLandmarks(smoothWorldLm, poseRes.worldLandmarks[0], LM_S);
+          // Debug hooks — let playwright / devtools introspect raw + smoothed state.
+          window.__rawWorldLm   = poseRes.worldLandmarks[0];
+          window.__rawImageLm   = poseRes.landmarks[0];
+          window.__smoothWorldLm = smoothWorldLm;
+
+          const hr = lastHandRes ?? { landmarks: [], worldLandmarks: [] };
+          const { leftHand: lH, rightHand: rH } = assignHands(
+            hr.landmarks, hr.worldLandmarks, smoothImageLm,
+          );
+          smoothLeftHand  = lH ? smoothLandmarks(smoothLeftHand,  lH, HAND_S) : null;
+          smoothRightHand = rH ? smoothLandmarks(smoothRightHand, rH, HAND_S) : null;
+        }
+      }
+
+      frameCount++;
+      if (now - fpsTs >= 1000) {
+        fps = frameCount; frameCount = 0; fpsTs = now;
+      }
+
+      ctx.fillStyle = "#0a0a0f";
+      ctx.fillRect(0, 0, W, H);
+
+      if (!smoothWorldLm) {
+        ctx.fillStyle = "#555";
+        ctx.font = "18px monospace";
+        ctx.fillText("Waiting for first pose…", W/2 - 120, H/2);
+        return;
+      }
+
+      const t1 = performance.now();
+      const deltas = landmarksToPoseDeltas({
+        pose:      smoothWorldLm,
+        leftHand:  smoothLeftHand  ?? undefined,
+        rightHand: smoothRightHand ?? undefined,
+        // Lower threshold so half-occluded limbs (e.g. twisted dancer's far arm)
+        // still drive their bones — a noisy estimate beats a stuck rest pose.
+        visibilityMin: 0.2,
+      }, model, boneIndex);
+      forwardKinematics(model, deltas, boneXforms);
+      const mesh = lbs(model, boneXforms, vertBuf);
+      const poseMs = (performance.now() - t1).toFixed(1);
+
+      const lS = smoothImageLm[11], rS = smoothImageLm[12];
+      const torsoW = Math.abs(lS.x - rS.x);
+      const rawScale = torsoW > 0.02 ? (torsoW * W) / 0.42 : sScale;
+      const shoulderY = ((lS.y + rS.y) / 2) * H;
+      const rawFootY  = shoulderY + 1.35 * rawScale;
+      const clampedScale = rawFootY > H - 20 ? (H - 20 - shoulderY) / 1.35 : rawScale;
+
+      sCx    += (((lS.x + rS.x) / 2) * W   - sCx)    * SMOOTH;
+      sScale += (clampedScale               - sScale) * SMOOTH;
+      sFootY += (shoulderY + 1.35 * sScale  - sFootY) * SMOOTH;
+
+      const HW = W / 2, HH = H / 2;
+      const vs = Math.min(sScale * 0.42, HH * 0.82 / 1.7);
+      const bodyH = 1.7 * vs;
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, vtxBufGL);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, mesh.vertices);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+
+      gl.clearColor(0.047, 0.047, 0.071, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      setWorldTwist(0);
+      const bfo = minRestZ * vs;
+      const fT = HH*0.1+bodyH+bfo, fB = HH+HH*0.1+bodyH+bfo;
+
+      drawGrid(HW*0.5, HH*0.1+bodyH,     vs,      -1, 0,           0);
+      glView  (HW*0.5, fT,                vs,      -1, 0,           0,    0.88,0.90,0.95); // FRONT
+      drawGrid(HW*1.5, HH*0.1+bodyH,     vs,      -1, Math.PI,     0);
+      glView  (HW*1.5, fT,                vs,      -1, Math.PI,     0,    0.95,0.90,0.85); // BACK
+      drawGrid(HW*0.5, HH+HH*0.1+bodyH,  vs,      -1, Math.PI*0.35,0);
+      glView  (HW*0.5, fB,                vs,      -1, Math.PI*0.35,0,    0.88,0.95,0.90); // 3/4
+      drawGrid(HW*1.5, HH+HH*0.55,       vs*0.6,   1, 0,           0.85);
+      glView  (HW*1.5, HH+HH*0.55+bfo*0.6, vs*0.6, 1, 0,           0.85, 0.92,0.88,0.96); // ABOVE
+
+      ctx.fillStyle = "transparent";
+      ctx.clearRect(0, 0, W, H);
+
+      ctx.strokeStyle = "#333"; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(HW, 0); ctx.lineTo(HW, H);
+      ctx.moveTo(0, HH); ctx.lineTo(W, HH);
+      ctx.stroke();
+
+      const label = (txt, qx, qy) => {
+        ctx.fillStyle = "rgba(255,255,255,0.45)";
+        ctx.font = "11px monospace";
+        ctx.fillText(txt, qx + 8, qy + 16);
+      };
+      label("FRONT", 0, 0); label("BACK", HW, 0);
+      label("3/4",   0, HH); label("ABOVE", HW, HH);
+
+      // Match the source video element (#src at 0,0 320×240, object-fit:contain).
+      // Compute the contain-fitted box so landmarks (which are normalised to the
+      // video's native aspect) overlay the visible frame exactly.
+      const SRC_W = 320, SRC_H = 240;
+      const vW = video.videoWidth || SRC_W, vH = video.videoHeight || SRC_H;
+      const fit = Math.min(SRC_W / vW, SRC_H / vH);
+      const drawW = vW * fit, drawH = vH * fit;
+      const offX = (SRC_W - drawW) / 2, offY = (SRC_H - drawH) / 2;
+      ctx.save();
+      ctx.globalAlpha = 0.6;
+      ctx.lineWidth = 2;
+      const lx = (i) => offX + lastImageLm[i].x * drawW;
+      const ly = (i) => offY + lastImageLm[i].y * drawH;
+      const bone = (a, b) => {
+        ctx.beginPath(); ctx.moveTo(lx(a), ly(a)); ctx.lineTo(lx(b), ly(b)); ctx.stroke();
+      };
+      ctx.strokeStyle = "#0f0";
+      bone(11,12); bone(11,23); bone(12,24); bone(23,24);
+      bone(11,13); bone(13,15); bone(12,14); bone(14,16);
+      bone(23,25); bone(25,27); bone(24,26); bone(26,28);
+      ctx.globalAlpha = 1;
+      ctx.restore();
+
+      ctx.fillStyle = "#4f4";
+      ctx.font = "12px monospace";
+      const hands = (smoothLeftHand ? "L" : "-") + (smoothRightHand ? "R" : "-");
+      ctx.fillText(`FK+LBS ${poseMs} ms   ${fps} fps   hands:${hands}`, 10, H - 10);
+    }
+
+    tick();
+  </script>
+</body>
+</html>

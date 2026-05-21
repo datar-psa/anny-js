@@ -1,6 +1,6 @@
 {
   "name": "anny-js",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Live 3D body animation in the browser — FK + LBS for the Anny body model (Apache 2.0). Drives 163 bones from MediaPipe Pose at < 2 ms.",
   "type": "module",
   "main": "./dist/index.js",

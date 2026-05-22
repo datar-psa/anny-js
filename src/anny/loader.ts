@@ -7,7 +7,7 @@ interface ArrayEntry {
   bytes: number;
 }
 
-interface Manifest {
+export interface AnnyManifest {
   version: number;
   bone_count: number;
   vert_count: number;
@@ -26,23 +26,11 @@ function viewOf(buf: ArrayBuffer, entry: ArrayEntry): Float32Array | Int32Array 
 }
 
 /**
- * Load Anny model from a manifest JSON URL and a binary data URL.
- * Both paths may be relative (browser fetch) or absolute (Node file://).
+ * Assemble an AnnyModel from an already-parsed manifest + binary buffer.
+ * Exposed for environments that read the data directly (Node/Bun tests,
+ * bundled inline assets) rather than via fetch.
  */
-export async function loadAnnyModel(
-  manifestUrl: string,
-  binUrl: string
-): Promise<AnnyModel> {
-  const [manifestRes, binRes] = await Promise.all([
-    fetch(manifestUrl),
-    fetch(binUrl),
-  ]);
-  if (!manifestRes.ok) throw new Error(`Failed to fetch manifest: ${manifestUrl}`);
-  if (!binRes.ok) throw new Error(`Failed to fetch binary: ${binUrl}`);
-
-  const manifest: Manifest = await manifestRes.json();
-  const buf = await binRes.arrayBuffer();
-
+export function parseAnnyModel(manifest: AnnyManifest, buf: ArrayBuffer): AnnyModel {
   const a = manifest.arrays;
   return {
     restVertices:   viewOf(buf, a.rest_vertices) as Float32Array,
@@ -57,4 +45,24 @@ export async function loadAnnyModel(
     boneCount:      manifest.bone_count,
     maxBonesPerVert: manifest.max_bones_per_vert,
   };
+}
+
+/**
+ * Load Anny model from a manifest JSON URL and a binary data URL.
+ * Both paths may be relative (browser fetch) or absolute (Node file://).
+ */
+export async function loadAnnyModel(
+  manifestUrl: string,
+  binUrl: string
+): Promise<AnnyModel> {
+  const [manifestRes, binRes] = await Promise.all([
+    fetch(manifestUrl),
+    fetch(binUrl),
+  ]);
+  if (!manifestRes.ok) throw new Error(`Failed to fetch manifest: ${manifestUrl}`);
+  if (!binRes.ok) throw new Error(`Failed to fetch binary: ${binUrl}`);
+
+  const manifest: AnnyManifest = await manifestRes.json();
+  const buf = await binRes.arrayBuffer();
+  return parseAnnyModel(manifest, buf);
 }

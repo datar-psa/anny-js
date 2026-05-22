@@ -1,9 +1,10 @@
-export type { AnnyModel, Mat4, PoseDeltas, SkinnedMesh } from "./types.js";
-export { loadAnnyModel } from "./loader.js";
-export { forwardKinematics, allocBoneTransforms, identityDeltas, setDelta, setDeltas, buildBoneIndex } from "./fk.js";
-export { lbs, allocVertexBuffer } from "./lbs.js";
-export { landmarksToPoseDeltas, assignHands, MP, MP_HAND } from "./mediapipe.js";
-export type { Landmark, WorldLandmark, PoseInput } from "./mediapipe.js";
-export { renderAnny } from "./render2d.js";
-export type { RenderOptions } from "./render2d.js";
-export { rodriguesToMat3, rotFromTo, mat4Identity, mat4Mul } from "./math.js";
+/** anny-js public surface.
+ *
+ * Two domains, importable separately or together:
+ *   • `anny-js/anny`      — core: model loading, FK, LBS, 2D renderer (no MP dep)
+ *   • `anny-js/mediapipe` — MediaPipe Pose + Hand → Anny bone deltas
+ *
+ * Importing from `anny-js` root re-exports everything for back-compat. */
+
+export * from "./anny/index.js";
+export * from "./mediapipe/index.js";

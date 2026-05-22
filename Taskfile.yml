@@ -9,32 +9,45 @@ tasks:
   # ── Development ────────────────────────────────────────────────────────────
 
   build:
-    desc: Compile TypeScript → dist/
+    desc: Compile TypeScript → dist/ (library)
     cmds:
       - bunx tsc
     sources: [src/**/*.ts, tsconfig.json]
     generates: [dist/**/*.js]
 
+  build:demo:
+    desc: Build the demo site → dist-demo/
+    cmds: [bunx vite build]
+
   dev:
-    desc: Watch-mode TypeScript compilation
+    desc: Watch-mode TypeScript compilation (library)
     cmds: [bunx tsc --watch]
 
   check:
-    desc: Type-check without emitting
-    cmds: [bunx tsc --noEmit]
+    desc: Type-check everything (src + demo + tests + tools)
+    cmds: [bunx tsc --noEmit -p tsconfig.check.json]
+
+  test:
+    desc: Run all tests (unit + parity)
+    cmds: [bun test]
 
   clean:
     desc: Remove build output
-    cmds: [rm -rf dist/]
+    cmds: [rm -rf dist/ dist-demo/]
 
   demo:
-    desc: Build then serve demos locally at http://localhost:3000
-    deps: [build]
-    cmds: [bunx serve . -p 3000 --cors]
+    desc: Serve demos via Vite dev server at http://localhost:3000 (HMR enabled)
+    cmds: [bunx vite]
 
-  demo:dev:
-    desc: Serve from local paths (no build needed — for fast iteration)
-    cmds: [bunx serve . -p 3000 --cors]
+  fixtures:
+    desc: "Regenerate Python-anny parity fixtures (needs body-tuning venv active)"
+    cmds:
+      - python tools/gen_parity_fixtures.py
+
+  fixtures:landmarks:
+    desc: "Capture MediaPipe landmark fixtures from demo videos (needs `task demo` running)"
+    cmds:
+      - bun tools/capture_landmarks.ts
 
   # ── Versioning (package.json as single source of truth) ────────────────────
 
@@ -90,7 +103,7 @@ tasks:
 
   _build:
     internal: true
-    deps: [check]
+    deps: [check, test]
     cmds:
       - rm -rf dist/
       - bunx tsc
@@ -126,7 +139,7 @@ tasks:
 
   deploy:
     desc: "Deploy to anny-js.clad.you (Firebase Hosting under clad-main)"
-    deps: [build]
+    deps: [build, "build:demo"]
     cmds:
       - bunx firebase deploy --only hosting:{{.PKG_NAME}} --project {{.FIREBASE_PROJECT}}
 

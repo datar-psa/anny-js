@@ -1,28 +1,28 @@
 {
   "hosting": {
     "site": "anny-js",
-    "public": ".",
+    "public": "dist-demo",
     "ignore": [
       "firebase.json", ".gitignore", ".npmignore",
-      "**/node_modules/**", "src/**", "tools/**", "bun.lock"
+      "**/node_modules/**", "**/.*"
     ],
     "headers": [
       {
-        "source": "assets/anny_model.bin",
+        "source": "anny_model.bin",
         "headers": [{ "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }]
       },
       {
-        "source": "dist/**",
-        "headers": [{ "key": "Cache-Control", "value": "public, max-age=604800" }]
+        "source": "assets/**",
+        "headers": [{ "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }]
       }
     ],
     "rewrites": [
-      { "source": "/",                  "destination": "/demo/anim.html" },
-      { "source": "/demo",              "destination": "/demo/anim.html" },
-      { "source": "/demo/mediapipe",    "destination": "/demo/live.html" },
-      { "source": "/live",              "destination": "/demo/live.html" },
-      { "source": "/demo/video",        "destination": "/demo/video.html" },
-      { "source": "/video",             "destination": "/demo/video.html" }
+      { "source": "/",                  "destination": "/index.html" },
+      { "source": "/demo",              "destination": "/anim.html" },
+      { "source": "/demo/mediapipe",    "destination": "/live.html" },
+      { "source": "/live",              "destination": "/live.html" },
+      { "source": "/demo/video",        "destination": "/video.html" },
+      { "source": "/video",             "destination": "/video.html" }
     ]
   }
 }

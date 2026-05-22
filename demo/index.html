@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>anny-js — Anny in the browser + MediaPipe</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0c0c12; color: #ccc; font: 14px/1.55 system-ui; min-height: 100vh; }
+    main { max-width: 780px; margin: 0 auto; padding: 60px 24px; }
+    h1 { font-weight: 600; font-size: 30px; color: #fff; letter-spacing: .02em; margin-bottom: 10px; }
+    h1 span { color: #4af; }
+    p.tagline { color: #aaa; margin-bottom: 26px; max-width: 640px; }
+    p.tagline strong { color: #ddd; font-weight: 500; }
+    .pillars {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
+      margin-bottom: 40px;
+    }
+    .pillar {
+      padding: 16px 18px; border-radius: 8px;
+      background: #14141d; border: 1px solid #222230;
+    }
+    .pillar h3 { font-size: 13px; font-weight: 600; color: #4af; margin-bottom: 4px; letter-spacing: .04em; text-transform: uppercase; }
+    .pillar p  { font-size: 13px; color: #aaa; }
+    h2 { font-size: 13px; font-weight: 600; color: #888; margin-bottom: 14px; letter-spacing: .05em; text-transform: uppercase; }
+    .grid { display: grid; gap: 14px; }
+    a.card {
+      display: block; padding: 22px 24px; border-radius: 8px;
+      background: #161620; border: 1px solid #2a2a38; text-decoration: none; color: inherit;
+      transition: border-color 120ms, background 120ms;
+    }
+    a.card:hover { border-color: #4af; background: #1a1a26; }
+    a.card h3 { font-size: 18px; color: #fff; margin-bottom: 4px; font-weight: 500; }
+    a.card p  { font-size: 13px; color: #aaa; }
+    a.card .pill {
+      display: inline-block; padding: 2px 8px; border-radius: 999px;
+      font: 10px/1.4 monospace; color: #4af; background: rgba(74,170,255,.1);
+      margin-left: 6px; vertical-align: middle;
+    }
+    nav { margin-top: 44px; display: flex; gap: 20px; font: 12px monospace; }
+    nav a { color: #6ab; text-decoration: none; }
+    nav a:hover { color: #4af; }
+  </style>
+</head>
+<body>
+<main>
+  <h1><span>anny</span>-js</h1>
+  <p class="tagline">
+    A browser-native JavaScript runtime for <strong><a href="https://github.com/naver/anny" style="color:#ddd;text-decoration:underline;">Anny</a></strong>
+    — Naver's open-source parametric 3D body model — plus a <strong>MediaPipe Pose + Hand driver</strong> that maps live landmarks onto Anny's 163-bone rig. No server, no Python, no native modules.
+  </p>
+
+  <div class="pillars">
+    <div class="pillar">
+      <h3>Anny in JS</h3>
+      <p>Forward kinematics + linear blend skinning ported from Python anny to TypeScript. Parity-tested: &lt; 1e-5 on bone transforms, &lt; 0.1 mm on vertices.</p>
+    </div>
+    <div class="pillar">
+      <h3>MediaPipe → Anny</h3>
+      <p>33 pose + 21×2 hand landmarks per frame → 163 bone deltas. Parent-corrected, angle-clamped, proximity-based L/R hand assignment.</p>
+    </div>
+  </div>
+
+  <h2>Try the demos</h2>
+  <div class="grid">
+    <a class="card" href="./anim.html">
+      <h3>🎬 Animation <span class="pill">Anny runtime only</span></h3>
+      <p>Procedural backflip drives the rig directly with rotation matrices — proves FK + LBS work in the browser. No webcam, no inference, just <code>setDelta</code> + <code>forwardKinematics</code> at 30 fps.</p>
+    </a>
+    <a class="card" href="./live.html">
+      <h3>📷 Live webcam <span class="pill">Anny + MediaPipe</span></h3>
+      <p>Your webcam → MediaPipe Pose + Hand → Anny. All 163 bones drive in real time, including 38 finger bones. 4-view WebGL render with built-in WebM recorder.</p>
+    </a>
+    <a class="card" href="./video.html">
+      <h3>🎞 Pre-recorded video <span class="pill">Anny + MediaPipe (heavy)</span></h3>
+      <p>Same pipeline as live but offline, on bundled clips with the heavy MediaPipe pose model. Best for inspecting driver quality without webcam noise.</p>
+    </a>
+  </div>
+
+  <nav>
+    <a href="https://github.com/datar-psa/anny-js" target="_blank" rel="noopener">GitHub</a>
+    <a href="https://www.npmjs.com/package/anny-js" target="_blank" rel="noopener">npm</a>
+    <a href="https://github.com/naver/anny" target="_blank" rel="noopener">Anny (upstream)</a>
+  </nav>
+</main>
+</body>
+</html>

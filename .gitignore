@@ -5,6 +5,10 @@ dist-demo/
 tools/__pycache__/
 tools/venv/
 
+# Tool caches — regenerated locally on every `task` / `firebase deploy` invocation.
+.firebase/
+.task/
+
 # Captured landmark fixtures are regeneratable via `task fixtures:landmarks`.
 # Keep small commits — large MP4-derived JSONs hurt git size.
 tests/mediapipe/fixtures/*_landmarks.json

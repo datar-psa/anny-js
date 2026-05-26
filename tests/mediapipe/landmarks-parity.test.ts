@@ -118,4 +118,63 @@ describe("MediaPipe → Anny driver — angular parity", () => {
         .toBeLessThan(maxMeanDeg);
     });
   }
+
+  /**
+   * Stickiness regression: on the boxer fixture, the left elbow sits at
+   * visibility ≈ 0.19 (just below the 0.2 driver threshold) for ~15% of
+   * frames. Without temporal stickiness those frames drop upperarm01.L to
+   * the parent chain pose, producing 60–100° angular spikes on the left arm
+   * and a visible "snap to spine" in the rendered body.
+   *
+   * With `previousDeltas` chained frame-to-frame, the left arm should hold
+   * its last driven pose during those dips. The L_lowerarm max error must
+   * fall from 100°+ (no stickiness) to single digits (with stickiness).
+   */
+  test("boxer fixture: chained previousDeltas eliminates left-arm visibility spikes", async () => {
+    const data: { frames: { worldLandmarks: WorldLandmark[] }[] } = JSON.parse(
+      await Bun.file(resolve(FIXTURES, "boxer_landmarks.json")).text(),
+    );
+
+    const runChain = (chain: boolean): Record<string, number> => {
+      let prev: ReturnType<typeof landmarksToPoseDeltas> | undefined;
+      let maxErr = 0, maxUA = 0, maxLA = 0;
+      const xforms = allocBoneTransforms(model.boneCount);
+      for (const frame of data.frames) {
+        const deltas = landmarksToPoseDeltas(
+          {
+            pose: frame.worldLandmarks,
+            visibilityMin: 0.2,
+            previousDeltas: chain ? prev : undefined,
+          },
+          model, boneIndex,
+        );
+        prev = deltas;
+        forwardKinematics(model, deltas, xforms);
+        const { segments } = verifyPoseAlignment(model, boneIndex, xforms, frame.worldLandmarks);
+        for (const s of segments) {
+          if (s.errDeg > maxErr) maxErr = s.errDeg;
+          if (s.seg === "L_upperarm" && s.errDeg > maxUA) maxUA = s.errDeg;
+          if (s.seg === "L_lowerarm" && s.errDeg > maxLA) maxLA = s.errDeg;
+        }
+      }
+      return { maxErr, maxUA, maxLA };
+    };
+
+    const baseline = runChain(false);
+    const sticky   = runChain(true);
+
+    // Sanity: baseline must reproduce the documented spike (>= 60°). If MP
+    // upstream changes and this baseline drops, the test silently passes the
+    // sticky case for the wrong reason — keep us honest.
+    expect(baseline.maxLA, "baseline should exhibit left-arm spike").toBeGreaterThan(60);
+    expect(baseline.maxUA, "baseline should exhibit left-arm spike").toBeGreaterThan(60);
+
+    // With stickiness, the spike collapses. 30° upper bound: still some
+    // residual since the held delta is from a slightly older pose, but
+    // an order of magnitude below the snap-to-spine baseline.
+    expect(sticky.maxLA, `sticky L_lowerarm max ${sticky.maxLA.toFixed(1)}° (baseline ${baseline.maxLA.toFixed(1)}°)`)
+      .toBeLessThan(30);
+    expect(sticky.maxUA, `sticky L_upperarm max ${sticky.maxUA.toFixed(1)}° (baseline ${baseline.maxUA.toFixed(1)}°)`)
+      .toBeLessThan(30);
+  });
 });

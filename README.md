@@ -123,6 +123,14 @@ function onLandmarks(landmarks) {         // 33 × {x,y,z,visibility}
 
 See [`demo/live.html`](demo/live.html) for the full 4-view WebGL demo with recording.
 
+> **Hands:** pose tracking is solid; per-finger hand tracking from full-body
+> footage is unreliable (the hand is a few % of frame) and is **disabled by
+> default** in the video demo. The whole hand pipeline is kept intact and
+> re-enables with one flag. The investigation — MediaPipe's hand-local
+> coordinate frame, the rig's palmar/dorsal convention, the natural curl
+> synergy, and how to verify hands numerically — is written up in
+> [`docs/hand-tracking.md`](docs/hand-tracking.md).
+
 ---
 
 ## Demos

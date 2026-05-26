@@ -22,12 +22,6 @@ export interface RenderOptions {
   /** Optional outline color. Omit or set "" to skip. */
   outlineColor?: string;
   /**
-   * Flip X axis in rendering (default false).
-   * Set true for self-view / mirror mode so the avatar matches the CSS-mirrored
-   * camera preview: anatomical left renders on screen left, right on right.
-   */
-  flipX?: boolean;
-  /**
    * Rotation around the vertical (Z) axis in radians (default 0).
    * Positive = Anny's left side swings toward camera (figure appears to turn right).
    */
@@ -55,12 +49,9 @@ export function renderAnny(
   opts: RenderOptions
 ): void {
   const { vertices, faces } = mesh;
-  const { cx, footY, scale, color, outlineColor, flipX = false, viewRotY = 0, viewRotX = 0 } = opts;
-  const xSign = flipX ? -1 : 1;
-  const cosY = Math.cos(viewRotY), sinY = Math.sin(viewRotY);
+  const { cx, footY, scale, color, outlineColor, viewRotY = 0, viewRotX = 0 } = opts;
+  const cosR = Math.cos(viewRotY), sinR = Math.sin(viewRotY);
   const cosX = Math.cos(viewRotX), sinX = Math.sin(viewRotX);
-  // Keep cosR/sinR aliases so the rest of the function compiles unchanged.
-  const cosR = cosY, sinR = sinY;
   const faceCount = faces.length / 3;
 
   // No depth sort — back-face culling handles occlusion for closed meshes.
@@ -87,13 +78,14 @@ export function renderAnny(
     const rz0 = ry0*sinX + vz0*cosX;
     const rz1 = ry1*sinX + vz1*cosX;
     const rz2 = ry2*sinX + vz2*cosX;
-    const px0 = cx + xSign * rx0 * scale, py0 = footY - rz0*scale;
-    const px1 = cx + xSign * rx1 * scale, py1 = footY - rz1*scale;
-    const px2 = cx + xSign * rx2 * scale, py2 = footY - rz2*scale;
+    const px0 = cx + rx0 * scale, py0 = footY - rz0*scale;
+    const px1 = cx + rx1 * scale, py1 = footY - rz1*scale;
+    const px2 = cx + rx2 * scale, py2 = footY - rz2*scale;
 
-    // Back-face cull
+    // Back-face cull (third-person projection: anatomical-left renders on
+    // screen right when subject faces camera; CCW triangles are front-faces).
     const cross2d = (px1-px0)*(py2-py0) - (py1-py0)*(px2-px0);
-    if (xSign > 0 ? cross2d >= 0 : cross2d <= 0) continue;
+    if (cross2d >= 0) continue;
 
     ctx.moveTo(px0, py0);
     ctx.lineTo(px1, py1);

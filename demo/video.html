@@ -14,9 +14,23 @@
     }
     #picker button.active { background: #2a3a4a; color: #fff; border-color: #4af; }
     #picker button:hover { border-color: #4af; }
-    #src { position: fixed; top: 0; left: 0; width: 320px; height: 240px; opacity: 0.6; z-index: 3; object-fit: contain; background: #000; }
+    #layout { position: fixed; top: 6px; right: 12px; z-index: 20; display: flex; gap: 6px; }
+    #layout button {
+      background: #1a1a24; color: #ccc; border: 1px solid #333; border-radius: 4px;
+      padding: 5px 10px; font: 12px monospace; cursor: pointer;
+    }
+    #layout button.active { background: #2a3a4a; color: #fff; border-color: #4af; }
+    #layout button:hover { border-color: #4af; }
+    /* Default (4-view) layout: small thumbnail in the corner, GL fills canvas. */
+    #src { position: fixed; top: 0; left: 0; width: 320px; height: 240px; opacity: 0.6; z-index: 3; object-fit: contain; background: #000; transition: width 0.2s, height 0.2s, opacity 0.2s; }
+    /* Split layout: video fills the left half, opaque. */
+    body.split-layout #src {
+      width: 50vw; height: 100vh; opacity: 1;
+    }
     #gl  { position: fixed; top: 0; left: 0; z-index: 1; pointer-events: none; }
-    #c   { position: fixed; top: 0; left: 0; z-index: 2; pointer-events: none; background: transparent; }
+    /* The 2D canvas sits ABOVE the video so the green pose/hand skeleton
+       overlay renders on top of the source frame (z-index 4 > video's 3). */
+    #c   { position: fixed; top: 0; left: 0; z-index: 4; pointer-events: none; background: transparent; }
   </style>
 </head>
 <body>
@@ -24,6 +38,11 @@
   <div id="picker">
     <button data-src="/fixtures/boxer.mp4"  data-label="boxer"  class="active">🥊 boxer</button>
     <button data-src="/fixtures/dancer.mp4" data-label="dancer">💃 dancer</button>
+    <button data-src="/fixtures/poser.mp4"  data-label="poser">🤺 poser</button>
+  </div>
+  <div id="layout">
+    <button data-layout="four"  class="active">4 views</button>
+    <button data-layout="split">side-by-side</button>
   </div>
   <video id="src" autoplay muted loop playsinline crossorigin="anonymous"></video>
   <canvas id="gl"></canvas>

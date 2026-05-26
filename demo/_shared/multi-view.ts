@@ -95,11 +95,17 @@ export function buildFourViews(q: QuadrantLayout, opts: FourViewOptions = {}): F
   const aboveFootOff = q.footOffset * aboveScaleFactor;
   const aboveBodyY = HH + HH * 0.55 + aboveFootOff;
 
+  // Third-person rendering: anatomical-left lands on screen-right when the
+  // subject faces camera (FRONT), screen-left when they face away (BACK) —
+  // matching how a third-party camera would film the same subject. This is
+  // unconditional in the pipeline now; the legacy "self-mirror" mode was
+  // removed because comparing a self-mirrored model with third-person video
+  // footage causes a confusing left/right swap.
   const body = {
-    front:        { cx: HW * 0.5, footY: q.bodyTopY + bodyYOffset, scale: q.scale, xSign: -1 },
-    back:         { cx: HW * 1.5, footY: q.bodyTopY + bodyYOffset, scale: q.scale, xSign: -1, camY: Math.PI },
-    threeQuarter: { cx: HW * 0.5, footY: q.bodyBotY + bodyYOffset, scale: q.scale, xSign: -1, camY: threeQuarterAngle },
-    above:        { cx: HW * 1.5, footY: aboveBodyY + bodyYOffset, scale: aboveScale, xSign: 1, camX: 0.85 },
+    front:        { cx: HW * 0.5, footY: q.bodyTopY + bodyYOffset, scale: q.scale },
+    back:         { cx: HW * 1.5, footY: q.bodyTopY + bodyYOffset, scale: q.scale, camY: Math.PI },
+    threeQuarter: { cx: HW * 0.5, footY: q.bodyBotY + bodyYOffset, scale: q.scale, camY: threeQuarterAngle },
+    above:        { cx: HW * 1.5, footY: aboveBodyY + bodyYOffset, scale: aboveScale, camX: 0.85 },
   };
   const grid = {
     front:        { ...body.front,        footY: q.fyTopGrid },
@@ -137,4 +143,62 @@ export function drawDividers(ctx: CanvasRenderingContext2D, W: number, H: number
   ctx.fillText("BACK", HW + 8, 16);
   ctx.fillText("3/4",  8, HH + 16);
   ctx.fillText("ABOVE", HW + 8, HH + 16);
+}
+
+// ── Side-by-side video|model layout ───────────────────────────────────────
+//
+// Mirrors the Meshcapade homepage comparison: source video on the left half,
+// Anny model on the right half, both at the same vertical scale, model camera
+// fixed (no orbit) so that as the subject rotates in the video, the model
+// rotates with it — the most direct "is orientation tracking working?" view.
+
+export interface SplitViewLayout {
+  body: ViewParams;
+  grid: ViewParams;
+}
+
+/**
+ * Build a single FRONT-facing view sized to fill the right half of the
+ * canvas. The video element is expected to occupy the left half (via CSS in
+ * the demo HTML). Camera does NOT orbit — that's the whole point: a 90°
+ * world-space turn by the subject should produce a 90° turn in the model.
+ */
+export function buildSplitView(
+  W: number, H: number, minRestZ: number,
+): SplitViewLayout {
+  const rightCenterX = W * 0.75;
+  const scale = 0.7 * H / 1.7;
+  const bodyH = 1.7 * scale;
+  const footOffset = minRestZ * scale;
+  const footY = (H + bodyH) / 2 + footOffset;
+
+  const body: ViewParams = { cx: rightCenterX, footY, scale };
+  const grid: ViewParams = { ...body, footY: footY - footOffset };
+  return { body, grid };
+}
+
+/**
+ * Render the side-by-side layout into the GL canvas (right half only).
+ * Caller is responsible for clearing the framebuffer and uploading vertices.
+ */
+export function drawSplitView(gl: WebGLBundle, view: SplitViewLayout): void {
+  gl.drawGrid(view.grid);
+  gl.drawBody(view.body, VIEW_COLORS.FRONT);
+}
+
+/** Draw a vertical divider + side labels for the split layout. */
+export function drawSplitDivider(
+  ctx: CanvasRenderingContext2D, W: number, H: number,
+): void {
+  const HW = W / 2;
+  ctx.strokeStyle = "#333";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(HW, 0); ctx.lineTo(HW, H);
+  ctx.stroke();
+
+  ctx.fillStyle = "rgba(255,255,255,0.45)";
+  ctx.font = "11px monospace";
+  ctx.fillText("VIDEO", 8, 16);
+  ctx.fillText("MODEL", HW + 8, 16);
 }

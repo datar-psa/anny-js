@@ -3,7 +3,7 @@
 import {
   loadAnnyModel, buildBoneIndex,
   allocBoneTransforms, identityDeltas, setDeltas,
-  lbs, allocVertexBuffer,
+  lbs, allocVertexBuffer, allocNormalBuffer,
   forwardKinematics,
   rodriguesToMat3, rotFromTo,
 } from "../../src/anny/index.js";
@@ -23,6 +23,7 @@ statsEl.textContent = "model ready";
 const boneIndex  = buildBoneIndex(model);
 const boneXforms = allocBoneTransforms(model.boneCount);
 const vertBuf    = allocVertexBuffer(model);
+const nrmBuf     = allocNormalBuffer(model);
 const restMinZ   = minRestZ(model);
 const gl = setupWebGL(glCanvas, model);
 
@@ -149,7 +150,7 @@ function tick() {
 
   const t1 = performance.now();
   forwardKinematics(model, deltas, boneXforms);
-  const mesh = lbs(model, boneXforms, vertBuf);
+  const mesh = lbs(model, boneXforms, vertBuf, nrmBuf);
   const ms = (performance.now() - t1).toFixed(1);
 
   // Body height in pixels → vertical lift during aerial phase
@@ -165,6 +166,7 @@ function tick() {
   });
 
   gl.uploadVertices(mesh.vertices);
+  gl.uploadNormals(mesh.normals);
   gl.clear();
   gl.setWorldTwist(FLIP_ON ? rx : 0);
   drawFourViews(gl, views);

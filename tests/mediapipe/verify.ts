@@ -84,7 +84,52 @@ function angle(
 const M = {
   LSH: 11, RSH: 12, LEL: 13, REL: 14, LWR: 15, RWR: 16,
   LHIP: 23, RHIP: 24, LKN: 25, RKN: 26, LAN: 27, RAN: 28,
+  LEAR: 7, REAR: 8, LEYE: 2, REYE: 5, MOUTH_L: 9, MOUTH_R: 10,
 } as const;
+
+/**
+ * Rotate a *rest-world* direction through a bone's boneXforms 3×3 part to its
+ * pose-world direction. Used to ask "where does the rest-pose +X (or any other
+ * direction) end up after we pose this bone?" — needed for the head, where we
+ * don't reuse a bone-local axis convention but a fixed rest-world face frame.
+ *
+ *   boneXforms = pose @ inv(rest), so boneXforms_R @ v_restWorld = v_poseWorld.
+ */
+function rotateRestWorldDir(
+  boneXforms: Float32Array,
+  boneIdx: number,
+  vx: number, vy: number, vz: number,
+): [number, number, number] {
+  const o = boneIdx * 16;
+  const ox = boneXforms[o + 0]*vx + boneXforms[o + 1]*vy + boneXforms[o + 2]*vz;
+  const oy = boneXforms[o + 4]*vx + boneXforms[o + 5]*vy + boneXforms[o + 6]*vz;
+  const oz = boneXforms[o + 8]*vx + boneXforms[o + 9]*vy + boneXforms[o +10]*vz;
+  const L = Math.hypot(ox, oy, oz) || 1;
+  return [ox/L, oy/L, oz/L];
+}
+
+function orthonormalize(
+  raw: [number, number, number],
+  against: [number, number, number],
+): [number, number, number] {
+  const d = raw[0]*against[0] + raw[1]*against[1] + raw[2]*against[2];
+  const v: [number, number, number] = [
+    raw[0] - d*against[0], raw[1] - d*against[1], raw[2] - d*against[2],
+  ];
+  const L = Math.hypot(v[0], v[1], v[2]) || 1;
+  return [v[0]/L, v[1]/L, v[2]/L];
+}
+
+function crossv(
+  a: [number, number, number],
+  b: [number, number, number],
+): [number, number, number] {
+  return [
+    a[1]*b[2] - a[2]*b[1],
+    a[2]*b[0] - a[0]*b[2],
+    a[0]*b[1] - a[1]*b[0],
+  ];
+}
 
 /**
  * Compare the posed bone axes against MediaPipe-derived expected directions.
@@ -124,6 +169,42 @@ export function verifyPoseAlignment(
   if (spineY) {
     const spineDir = normSub(midpt(mpA.LSH, mpA.RSH), midpt(mpA.LHIP, mpA.RHIP));
     limbs.push(["spine", spineDir, spineY]);
+  }
+
+  // ── Head: check all three anatomical face axes ────────────────────────────
+  // In Anny rest world, +x = anatomical-left, +y = back, +z = up. So in the
+  // canonical T-pose: face-left = +x, face-up = +z, face-forward = -y. We
+  // rotate those rest-world directions through boneXforms[head] and compare
+  // against the MP-derived face frame (ears, eyes, mouth).
+  //
+  // Why three axes (not just forward): if only one is off, we get to read the
+  // bug. A 90° forward + 0° left means the head is rolled around its X axis;
+  // 90° forward + 90° up means the rest convention is wrong (cheek→camera);
+  // all three off the same way means a yaw error in the face-frame builder.
+  const headIdx = boneIndex.get("head");
+  const earsVisible = worldLandmarks[M.LEAR]?.visibility !== undefined
+    ? (worldLandmarks[M.LEAR].visibility ?? 1) > 0.2 && (worldLandmarks[M.REAR].visibility ?? 1) > 0.2
+    : true;
+  if (headIdx !== undefined && earsVisible) {
+    const lEar = mpToAnny(worldLandmarks[M.LEAR]);
+    const rEar = mpToAnny(worldLandmarks[M.REAR]);
+    const lEye = mpToAnny(worldLandmarks[M.LEYE]);
+    const rEye = mpToAnny(worldLandmarks[M.REYE]);
+    const lMth = mpToAnny(worldLandmarks[M.MOUTH_L]);
+    const rMth = mpToAnny(worldLandmarks[M.MOUTH_R]);
+
+    const mpLeft = normSub(lEar, rEar);
+    const mpUp   = orthonormalize(normSub(midpt(lEye, rEye), midpt(lMth, rMth)), mpLeft);
+    const mpFwd  = crossv(mpLeft, mpUp); // = anatomical-left × face-up
+
+    // boneXforms[head] applied to the rest-world face frame.
+    const annyLeft = rotateRestWorldDir(boneXforms, headIdx,  1,  0,  0);
+    const annyUp   = rotateRestWorldDir(boneXforms, headIdx,  0,  0,  1);
+    const annyFwd  = rotateRestWorldDir(boneXforms, headIdx,  0, -1,  0);
+
+    limbs.push(["head_left",    mpLeft, annyLeft]);
+    limbs.push(["head_up",      mpUp,   annyUp]);
+    limbs.push(["head_forward", mpFwd,  annyFwd]);
   }
 
   const segments: SegmentError[] = [];

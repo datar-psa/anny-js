@@ -19,6 +19,7 @@ function makeTinyModel(): AnnyModel {
   ]);
   return {
     restVertices: new Float32Array(0),
+    restNormals:  new Float32Array(0),
     faces: new Int32Array(0),
     boneWeights: new Float32Array(0),
     boneIndices: new Int32Array(0),

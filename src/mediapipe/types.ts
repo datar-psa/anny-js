@@ -1,5 +1,7 @@
 /** MediaPipe landmark types shared across the driver. */
 
+import type { PoseDeltas } from "../anny/types.js";
+
 /** A MediaPipe image-space landmark (normalized 0..1 with depth). */
 export interface Landmark {
   x: number;
@@ -37,4 +39,17 @@ export interface PoseInput {
    * Default 2.5 rad (~143°).
    */
   maxAngleRad?: number;
+  /**
+   * Per-bone deltas from the previous frame, used as a fallback for bones
+   * the current frame can't drive (low landmark visibility, missing hand
+   * detection). Without this, an under-threshold bone falls back to its
+   * parent's chain pose every frame — making the limb snap to the spine
+   * whenever MP's confidence dips below the threshold, which looks like a
+   * jerk in the rendered body. With stickiness, the limb holds its last
+   * driven pose until fresh landmarks come back.
+   *
+   * Pass the array returned by the previous `landmarksToPoseDeltas` call.
+   * Length must equal the model's bone count; otherwise ignored.
+   */
+  previousDeltas?: PoseDeltas;
 }

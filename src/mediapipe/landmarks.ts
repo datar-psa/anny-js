@@ -327,7 +327,7 @@ function buildBodyTargets(ctx: TargetCtx, out: Map<string, BoneTarget>): void {
 
 function arm(
   ctx: TargetCtx, out: Map<string, BoneTarget>, side: "L"|"R",
-  SH: number, EL: number, WR: number, IX: number,
+  SH: number, EL: number, WR: number, _IX: number,
 ): void {
   if (pairVisible(ctx, SH, EL)) {
     const a = new Float32Array(poseAt(ctx, SH)), b = new Float32Array(poseAt(ctx, EL));
@@ -337,10 +337,10 @@ function arm(
     const a = new Float32Array(poseAt(ctx, EL)), b = new Float32Array(poseAt(ctx, WR));
     out.set(`lowerarm01.${side}`, { kind: "dir", worldY: normSub(b, a) });
   }
-  if (pairVisible(ctx, WR, IX)) {
-    const a = new Float32Array(poseAt(ctx, WR)), b = new Float32Array(poseAt(ctx, IX));
-    out.set(`wrist.${side}`, { kind: "dir", worldY: normSub(b, a) });
-  }
+  // We don't set a wrist target from POSE here — pose only sees the
+  // knuckles' centroid (via INDEX), which is noisy on a closed fist. The
+  // wrist is driven from MP HAND data in `buildHandTargets` (when a hand
+  // is supplied). With no hand, the wrist inherits the forearm chain.
 }
 
 function leg(
@@ -364,49 +364,246 @@ function leg(
 // ── Hand finger bone target builder ────────────────────────────────────────
 
 /**
- * Map MP Hand landmarks (21) → finger bone targets (19 per hand).
+ * MP Hand worldLandmarks (21) → 20 hand bone targets per hand:
+ *   • wrist.{L,R}                       — set from POSE (not hand) for stability
+ *   • finger1-{1,2,3}.{L,R}             — thumb phalanges
+ *   • metacarpal{1..4}.{L,R}            — index/middle/ring/pinky metacarpals
+ *   • finger{2..5}-{1,2,3}.{L,R}        — index/middle/ring/pinky phalanges
  *
- * Anny rig:
- *   • Thumb (3 phalanges, no metacarpal): finger1-1, finger1-2, finger1-3
- *   • Index/Middle/Ring/Pinky (metacarpal + 3 phalanges):
- *       metacarpal{1,2,3,4} → finger{2,3,4,5}-{1,2,3}
+ * ─── Why this is more involved than it looks ────────────────────────────────
  *
- * Also drives `wrist.{L,R}` from MP hand's wrist→middle-MCP, overriding the
- * coarse pose-only direction.
+ * MP Hand `worldLandmarks` are NOT in camera/world coordinates. Empirically
+ * (see `tools/inspect_hand_frame.ts`): as the subject's forearm rotates ~90°
+ * across frames, the raw `WRIST → MIDDLE_MCP` direction in MP world stays
+ * essentially constant. That can only happen if MP is emitting landmarks in
+ * a **hand-local canonical frame** — the hand is normalised to a canonical
+ * orientation before being returned. (MP's API doc says "real-world 3D in
+ * meters" which we initially read as world-aligned, but the metric scale is
+ * the only world-aligned property; the *orientation* is hand-canonical.)
+ *
+ * Driving Anny bones with these raw landmarks therefore makes the model's
+ * hand point in a constant direction regardless of where the arm actually
+ * is — exactly the "wrist totally different way" symptom on the dancer clip.
+ *
+ * Fix: derive a hand-local→world rotation from POSE's own coarse hand
+ * landmarks (LEFT_INDEX / LEFT_PINKY at indices 17/19, R analogues at
+ * 18/20). Pose landmarks ARE in world coords, so the same triangle (WRIST,
+ * INDEX-knuckle, PINKY-knuckle) read from both pose and hand gives us two
+ * matching frames; the rotation between them aligns hand-local data to
+ * world. Apply that rotation to each direction we send to the rig.
+ *
+ * The wrist bone itself is driven from pose alone — pose's INDEX/PINKY are
+ * already at the knuckles, and `pose_WRIST → mid(pose_INDEX, pose_PINKY)`
+ * gives a clean "hand points this way" world direction without going
+ * through the hand model's hand-local frame at all.
  */
 function buildHandTargets(
+  ctx: TargetCtx,
   hand: WorldLandmark[],
   side: "L"|"R",
-  mirrorX: boolean,
   out: Map<string, BoneTarget>,
 ): void {
+  const POSE = side === "L"
+    ? { WRIST: MP.LEFT_WRIST,  INDEX: MP.LEFT_INDEX,  PINKY: MP.LEFT_PINKY  }
+    : { WRIST: MP.RIGHT_WRIST, INDEX: MP.RIGHT_INDEX, PINKY: MP.RIGHT_PINKY };
+  if (!visible(ctx.pose[POSE.WRIST], ctx.visMin) ||
+      !visible(ctx.pose[POSE.INDEX], ctx.visMin) ||
+      !visible(ctx.pose[POSE.PINKY], ctx.visMin)) {
+    return;  // No pose anchors → can't align; skip this hand.
+  }
+
+  // ── Build orthonormal frames in WORLD and HAND-LOCAL ────────────────────
+  // Axes (anatomical, by convention shared between both frames):
+  //   Y = forward (wrist → mid-knuckles)
+  //   X = radial (pinky → index, projected perpendicular to Y)
+  //   Z = palmward (palm normal pointing AWAY from back-of-hand)
+  //
+  // The Z direction can't be derived from just X and Y — cross(X,Y) is
+  // dorsal in some hand poses, palmward in others, depending on world
+  // orientation. We force Z to point palmward in BOTH frames by using a
+  // THIRD anchor: the thumb. The thumb sits on the palmar side of the
+  // wrist on every natural hand pose, so its projection onto Z must be
+  // positive. If not, flip Z.
+  //
+  // This makes wZ and lZ both unambiguously palmward, so the rotation
+  // R = W·Lᵀ maps palmward-to-palmward — no finger-curl mirroring.
+  const POSE_THUMB = side === "L" ? MP.LEFT_THUMB : MP.RIGHT_THUMB;
+  const thumbVisible = visible(ctx.pose[POSE_THUMB], ctx.visMin);
+  if (!thumbVisible) return;   // need thumb for palm-side disambiguation
+
+  const pW = new Float32Array(poseAt(ctx, POSE.WRIST));
+  const pI = new Float32Array(poseAt(ctx, POSE.INDEX));
+  const pP = new Float32Array(poseAt(ctx, POSE.PINKY));
+  const pT = new Float32Array(poseAt(ctx, POSE_THUMB));
+
+  const buildFrame = (W: Float32Array, I: Float32Array, P: Float32Array, T: Float32Array): { X: Float32Array; Y: Float32Array; Z: Float32Array } => {
+    const Y = normSub(midpoint(I, P), W);
+    const Xraw = normSub(I, P);
+    const xd = Xraw[0]*Y[0] + Xraw[1]*Y[1] + Xraw[2]*Y[2];
+    const X = normalize3(new Float32Array([
+      Xraw[0] - xd*Y[0], Xraw[1] - xd*Y[1], Xraw[2] - xd*Y[2],
+    ]));
+    let Z = normalize3(cross(X, Y));
+    // Force Z palmward via thumb: thumb sits on the palmar side, so
+    // (T - mid) projected onto Z must be positive. If negative, flip Z.
+    const mid = midpoint(I, P);
+    const tProj = (T[0]-mid[0])*Z[0] + (T[1]-mid[1])*Z[1] + (T[2]-mid[2])*Z[2];
+    if (tProj < 0) Z = new Float32Array([-Z[0], -Z[1], -Z[2]]);
+    return { X, Y, Z };
+  };
+
+  const Wfr = buildFrame(pW, pI, pP, pT);
+
+  // Hand-local: same convention, using the hand model's analogues.
+  // MP world hand landmarks are emitted in a frame where (per the world
+  // landmark projection calculator's 2D-only rotation) X and Y are roughly
+  // image-aligned but Z is in the model's canonical depth direction — which
+  // doesn't track the real palm-toward / palm-away orientation. The thumb
+  // anchor above resolves this ambiguity: hT_local sits on the palmar side
+  // of the local frame too, so the flip rule corrects any mismatch.
+  const lm = (i: number): Float32Array => new Float32Array([hand[i].x, hand[i].z, -hand[i].y]);
+  const Lfr = buildFrame(lm(MP_HAND.WRIST), lm(MP_HAND.INDEX_MCP), lm(MP_HAND.PINKY_MCP), lm(MP_HAND.THUMB_CMC));
+
+  const wX = Wfr.X, wY = Wfr.Y, wZ = Wfr.Z;
+  const lX = Lfr.X, lY = Lfr.Y, lZ = Lfr.Z;
+
+  // ── Rotation hand-local → world: R = W · Lᵀ ──────────────────────────────
+  // W has axes (wX, wY, wZ) as columns; L likewise. For any v in local frame:
+  //   v_world = W · (Lᵀ · v_local)     because Lᵀ · v_local extracts (v·lX, v·lY, v·lZ)
+  //                                     and W reassembles them in world basis.
+  const apply = (v: Float32Array): Float32Array => {
+    const a = v[0]*lX[0] + v[1]*lX[1] + v[2]*lX[2];
+    const b = v[0]*lY[0] + v[1]*lY[1] + v[2]*lY[2];
+    const c = v[0]*lZ[0] + v[1]*lZ[1] + v[2]*lZ[2];
+    return new Float32Array([
+      a*wX[0] + b*wY[0] + c*wZ[0],
+      a*wX[1] + b*wY[1] + c*wZ[1],
+      a*wX[2] + b*wY[2] + c*wZ[2],
+    ]);
+  };
+
+  // Convert all 21 hand landmarks to Anny-coord displacement-from-wrist,
+  // then rotate into world frame via `apply`. Absolute position doesn't
+  // matter — we only compute direction vectors between landmarks below.
+  const hWmp = hand[MP_HAND.WRIST];
   const pts: Float32Array[] = new Array(21);
   for (let i = 0; i < 21; i++) {
-    pts[i] = new Float32Array(3);
-    mpToAnny(hand[i], mirrorX, pts[i]);
+    const v = hand[i];
+    pts[i] = apply(new Float32Array([v.x - hWmp.x, v.z - hWmp.z, -v.y - (-hWmp.y)]));
   }
-  const dir = (a: number, b: number) => normSub(pts[b], pts[a]);
+  const dir = (a: number, b: number) => {
+    const d = new Float32Array([pts[b][0]-pts[a][0], pts[b][1]-pts[a][1], pts[b][2]-pts[a][2]]);
+    return normalize3(d);
+  };
 
-  out.set(`wrist.${side}`, { kind: "dir", worldY: dir(MP_HAND.WRIST, MP_HAND.MIDDLE_MCP) });
+  // ── Wrist: pose-only ─────────────────────────────────────────────────────
+  // Pose's INDEX/PINKY sit at the knuckles in world space; their midpoint
+  // minus pose.WRIST is the cleanest "where the hand points" signal we have,
+  // and it's the same `wY` we just used to build the world frame. Reuse it.
+  out.set(`wrist.${side}`, { kind: "dir", worldY: wY });
 
-  // Thumb
-  out.set(`finger1-1.${side}`, { kind: "dir", worldY: dir(MP_HAND.THUMB_CMC, MP_HAND.THUMB_MCP) });
-  out.set(`finger1-2.${side}`, { kind: "dir", worldY: dir(MP_HAND.THUMB_MCP, MP_HAND.THUMB_IP) });
-  out.set(`finger1-3.${side}`, { kind: "dir", worldY: dir(MP_HAND.THUMB_IP, MP_HAND.THUMB_TIP) });
-
-  // Fingers 2-5 (index, middle, ring, pinky)
+  // ── Metacarpals (index/middle/ring/pinky) ────────────────────────────────
   const fingers: ReadonlyArray<{ name: string; mc: number; pip: number; dip: number; tip: number; meta: string }> = [
     { name: "finger2", meta: "metacarpal1", mc: MP_HAND.INDEX_MCP,  pip: MP_HAND.INDEX_PIP,  dip: MP_HAND.INDEX_DIP,  tip: MP_HAND.INDEX_TIP  },
     { name: "finger3", meta: "metacarpal2", mc: MP_HAND.MIDDLE_MCP, pip: MP_HAND.MIDDLE_PIP, dip: MP_HAND.MIDDLE_DIP, tip: MP_HAND.MIDDLE_TIP },
     { name: "finger4", meta: "metacarpal3", mc: MP_HAND.RING_MCP,   pip: MP_HAND.RING_PIP,   dip: MP_HAND.RING_DIP,   tip: MP_HAND.RING_TIP   },
     { name: "finger5", meta: "metacarpal4", mc: MP_HAND.PINKY_MCP,  pip: MP_HAND.PINKY_PIP,  dip: MP_HAND.PINKY_DIP,  tip: MP_HAND.PINKY_TIP  },
   ];
+  const rawMeta = fingers.map(f => dir(MP_HAND.WRIST, f.mc));
+
+  // ── De-splay the metacarpals ─────────────────────────────────────────────
+  // On a full-body shot the hand is a few % of frame, so per-knuckle MP
+  // landmarks are noisy and the four metacarpal directions splay into a claw.
+  // Real fingers fan only slightly, so we blend each metacarpal toward the
+  // mean knuckle direction — keeping a little natural fan, killing the splay.
+  const meanMeta = normalize3(new Float32Array([
+    rawMeta.reduce((s,d)=>s+d[0],0), rawMeta.reduce((s,d)=>s+d[1],0), rawMeta.reduce((s,d)=>s+d[2],0),
+  ]));
+  const SPLAY = 0.45; // 0 = all fingers parallel, 1 = raw MP splay
+  const metaDir: Record<string, Float32Array> = {};
+  fingers.forEach((f, i) => {
+    metaDir[f.meta] = normalize3(new Float32Array([
+      meanMeta[0] + SPLAY*(rawMeta[i][0]-meanMeta[0]),
+      meanMeta[1] + SPLAY*(rawMeta[i][1]-meanMeta[1]),
+      meanMeta[2] + SPLAY*(rawMeta[i][2]-meanMeta[2]),
+    ]));
+    out.set(`${f.meta}.${side}`, { kind: "dir", worldY: metaDir[f.meta] });
+  });
+
+  // ── Dorsal / palmar direction (rig fan normal) ───────────────────────────
+  // Empirically (tools/probe_curl_direction.ts) `cross(indexMeta, pinkyMeta)`
+  // points DORSAL on the left hand; index & pinky are mirror-arranged so it
+  // points palmar on the right — negate for R. Palmar = −dorsal: the side a
+  // natural finger curls toward and the thumb sits on.
+  const fanRaw = normalize3(cross(metaDir.metacarpal1, metaDir.metacarpal4));
+  const dorsal = side === "L" ? fanRaw : new Float32Array([-fanRaw[0], -fanRaw[1], -fanRaw[2]]);
+  const palmar = new Float32Array([-dorsal[0], -dorsal[1], -dorsal[2]]);
+
+  // ── Coordinated finger curl ──────────────────────────────────────────────
+  // Driving each phalange straight from its own MP segment makes a splayed,
+  // half-curled "alien claw" — the per-finger noise dominates. Real fingers
+  // 2-5 flex together. So we derive ONE shared flex angle per joint level
+  // (averaged across the four fingers, palmar component only) and rebuild
+  // each finger by progressively rotating its metacarpal toward the palm.
+  // Result: a coherent open-hand ↔ fist that can never bend backward.
+  const angleBetween = (a: Float32Array, b: Float32Array): number => {
+    const d = Math.max(-1, Math.min(1, a[0]*b[0]+a[1]*b[1]+a[2]*b[2]));
+    return Math.acos(d);
+  };
+  /** Rotate `d` toward `palmar` by `theta`, staying in their common plane. */
+  const flexPalmar = (d: Float32Array, theta: number): Float32Array => {
+    const proj = d[0]*palmar[0] + d[1]*palmar[1] + d[2]*palmar[2];
+    const perp = normalize3(new Float32Array([
+      palmar[0]-proj*d[0], palmar[1]-proj*d[1], palmar[2]-proj*d[2],
+    ]));
+    const c = Math.cos(theta), s = Math.sin(theta);
+    return normalize3(new Float32Array([c*d[0]+s*perp[0], c*d[1]+s*perp[1], c*d[2]+s*perp[2]]));
+  };
+
+  // Overall curl "budget" per finger = total palmar bend summed over its
+  // three joints (palmar-going part only, so dorsal MP noise can't add curl).
+  // We do NOT trust MP's per-joint split: on a distant hand the DIP estimate
+  // is pure noise (measured DIP/PIP ratios ranged 0.0–1.2 vs the natural
+  // ~0.65). Instead we take the reliable TOTAL and redistribute it via fixed
+  // anatomical tendon-coupling ratios.
+  let budget = 0;
   for (const f of fingers) {
-    out.set(`${f.meta}.${side}`,   { kind: "dir", worldY: dir(MP_HAND.WRIST, f.mc) });
-    out.set(`${f.name}-1.${side}`, { kind: "dir", worldY: dir(f.mc, f.pip) });
-    out.set(`${f.name}-2.${side}`, { kind: "dir", worldY: dir(f.pip, f.dip) });
-    out.set(`${f.name}-3.${side}`, { kind: "dir", worldY: dir(f.dip, f.tip) });
+    const segs = [dir(MP_HAND.WRIST, f.mc), dir(f.mc, f.pip), dir(f.pip, f.dip), dir(f.dip, f.tip)];
+    for (let j = 0; j < 3; j++) {
+      const parent = segs[j], child = segs[j+1];
+      const childPalmar  = child[0]*palmar[0]  + child[1]*palmar[1]  + child[2]*palmar[2];
+      const parentPalmar = parent[0]*palmar[0] + parent[1]*palmar[1] + parent[2]*palmar[2];
+      if (childPalmar > parentPalmar) budget += angleBetween(parent, child);
+    }
   }
+  budget /= fingers.length;   // mean total curl across fingers 2-5 (radians)
+
+  // Natural curl synergy:
+  //   • Joint split MCP:PIP:DIP ≈ 0.35 : 0.40 : 0.25 (DIP/PIP ≈ 0.62, the
+  //     real tendon-coupled ratio) — applied to the curl budget.
+  //   • Slight finger cascade — index curls a touch less, pinky a touch more
+  //     — so the hand doesn't read as a single robotic block (real relaxed
+  //     hands show a few degrees of inter-finger variation).
+  const SPLIT = [0.35, 0.40, 0.25] as const;
+  const CASCADE: Record<string, number> = { finger2: 0.90, finger3: 1.00, finger4: 1.05, finger5: 1.10 };
+  for (const f of fingers) {
+    const total = budget * CASCADE[f.name];
+    const base = metaDir[f.meta];
+    const d1 = flexPalmar(base, total * SPLIT[0]);
+    const d2 = flexPalmar(d1,   total * SPLIT[1]);
+    const d3 = flexPalmar(d2,   total * SPLIT[2]);
+    out.set(`${f.name}-1.${side}`, { kind: "dir", worldY: d1 });
+    out.set(`${f.name}-2.${side}`, { kind: "dir", worldY: d2 });
+    out.set(`${f.name}-3.${side}`, { kind: "dir", worldY: d3 });
+  }
+
+  // ── Thumb (no metacarpal in rig) ────────────────────────────────────────
+  // The thumb opposes the palm rather than curling into it, so we keep its
+  // raw aligned directions (no coordination/clamp). Distant-hand thumb noise
+  // is minor and the thumb never reads as "claw".
+  out.set(`finger1-1.${side}`, { kind: "dir", worldY: dir(MP_HAND.THUMB_CMC, MP_HAND.THUMB_MCP) });
+  out.set(`finger1-2.${side}`, { kind: "dir", worldY: dir(MP_HAND.THUMB_MCP, MP_HAND.THUMB_IP) });
+  out.set(`finger1-3.${side}`, { kind: "dir", worldY: dir(MP_HAND.THUMB_IP, MP_HAND.THUMB_TIP) });
 }
 
 // ── Topological delta computation (the heart of the driver) ────────────────
@@ -505,6 +702,7 @@ export function landmarksToPoseDeltas(
     mirrorX = false,
     visibilityMin = 0.5,
     maxAngleRad = 2.5,
+    previousDeltas,
   } = input;
 
   const ctx: TargetCtx = {
@@ -517,8 +715,8 @@ export function landmarksToPoseDeltas(
   const named = new Map<string, BoneTarget>();
   buildBodyTargets(ctx, named);
   buildRootTarget(ctx, named, model, boneIndex);
-  if (leftHand)  buildHandTargets(leftHand,  "L", mirrorX, named);
-  if (rightHand) buildHandTargets(rightHand, "R", mirrorX, named);
+  if (leftHand)  buildHandTargets(ctx, leftHand,  "L", named);
+  if (rightHand) buildHandTargets(ctx, rightHand, "R", named);
 
   const byIdx = new Map<number, BoneTarget>();
   for (const [name, t] of named) {
@@ -526,5 +724,19 @@ export function landmarksToPoseDeltas(
     if (idx !== undefined) byIdx.set(idx, t);
   }
 
-  return computeDeltas(model, byIdx, maxAngleRad);
+  const deltas = computeDeltas(model, byIdx, maxAngleRad);
+
+  // Temporal stickiness: bones that couldn't be driven this frame inherit
+  // the previous frame's delta instead of snapping to the parent chain.
+  // Skip if the supplied previousDeltas doesn't match the rig — silently
+  // tolerant so callers can re-init mid-stream without crashing.
+  if (previousDeltas && previousDeltas.length === deltas.length) {
+    for (let i = 0; i < deltas.length; i++) {
+      if (deltas[i] === null && previousDeltas[i] !== null) {
+        deltas[i] = previousDeltas[i];
+      }
+    }
+  }
+
+  return deltas;
 }

@@ -2,18 +2,24 @@ import { MP, MP_HAND } from "./constants.js";
 import type { Landmark, WorldLandmark } from "./types.js";
 
 /**
- * Pick which detected hand is left vs right, using proximity of each hand's
- * 2D wrist landmark to the body's LEFT_WRIST / RIGHT_WRIST in image space.
+ * Assign detected MediaPipe hands to anatomical left/right slots using the
+ * **pose** landmarker's LEFT_WRIST / RIGHT_WRIST as ground truth.
  *
- * MediaPipe Hand Landmarker also returns a `handedness` label per hand, but
- * the label is computed in raw camera space and can be flipped vs. user
- * expectation when the display is mirrored. Proximity-to-body-wrist is more
- * robust and doesn't depend on which side of the camera the user is on.
+ * Why not MediaPipe Hand Landmarker's own `handedness` label: per the MP
+ * docs, "handedness is determined assuming the input image is mirrored…If
+ * it is not the case, please swap." For raw camera frames (third-person
+ * video, or webcam where the mirror is only applied in CSS for display),
+ * MP's labels are inverted from the subject's anatomy. Pose's left/right
+ * wrists, in contrast, are anatomical by definition — pose's
+ * `MP.LEFT_WRIST` (idx 15) IS the subject's anatomical left wrist, with no
+ * mirror caveat.
+ *
+ * So: take each detected hand's image-space wrist, measure its distance to
+ * pose.LEFT_WRIST and pose.RIGHT_WRIST, and route to the closer side.
  *
  * @param handsImageLandmarks  HandLandmarker `result.landmarks` (image-space).
  * @param handsWorldLandmarks  HandLandmarker `result.worldLandmarks`.
  * @param poseImageLandmarks   PoseLandmarker `result.landmarks[0]` (image-space).
- * @returns                    Assigned world-space landmark arrays for the API.
  */
 export function assignHands(
   handsImageLandmarks: Landmark[][],
@@ -37,7 +43,10 @@ export function assignHands(
     return out;
   }
 
-  // ≥2 detected: pick the assignment with minimum total mismatch.
+  // ≥2 detected: bipartite match — pick the (det0→L, det1→R) vs (det0→R,
+  // det1→L) assignment that minimises total distance to pose's anatomical
+  // wrists. Handles the boxing-guard case where both detections sit close
+  // together; pose's anatomical labels still pull each to its correct side.
   const [a, b] = handsImageLandmarks;
   const wa = a[MP_HAND.WRIST];
   const wb = b[MP_HAND.WRIST];

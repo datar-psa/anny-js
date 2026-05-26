@@ -15,11 +15,27 @@ export type PoseModelSize = keyof typeof POSE_MODELS;
 export interface MediaPipeBundle {
   poseLandmarker: PoseLandmarker;
   handLandmarker: HandLandmarker;
+  /**
+   * IMAGE-mode hand landmarker, only present when `handMode: "image"` was
+   * requested. Used by the ROI hand detector to run on each pose-wrist crop
+   * as an independent still image (no inter-frame tracking state to confuse).
+   */
+  handLandmarkerImage?: HandLandmarker;
 }
 
 export interface MediaPipeOptions {
   /** Pose model variant. `lite` for live webcam (default), `heavy` for offline video. */
   poseModel?: PoseModelSize;
+  /**
+   * Hand detector mode.
+   *   `video` (default): single VIDEO-mode HandLandmarker, runs on the full
+   *     frame each call. Works when hands are large in the image (live demo).
+   *   `image`: adds an extra IMAGE-mode HandLandmarker for the ROI detector
+   *     to run on per-wrist crops. Use this when subjects are far from camera
+   *     (offline-video demo) so the hands are too small for the full-frame
+   *     detector to find.
+   */
+  handMode?: "video" | "image";
 }
 
 /**
@@ -29,7 +45,7 @@ export interface MediaPipeOptions {
 export async function createMediaPipe(opts: MediaPipeOptions = {}): Promise<MediaPipeBundle> {
   const poseUrl = POSE_MODELS[opts.poseModel ?? "lite"];
   const vision = await FilesetResolver.forVisionTasks(VISION_WASM);
-  const [poseLandmarker, handLandmarker] = await Promise.all([
+  const tasks: Promise<unknown>[] = [
     PoseLandmarker.createFromOptions(vision, {
       baseOptions: { modelAssetPath: poseUrl, delegate: "GPU" },
       runningMode: "VIDEO",
@@ -40,6 +56,29 @@ export async function createMediaPipe(opts: MediaPipeOptions = {}): Promise<Medi
       runningMode: "VIDEO",
       numHands: 2,
     }),
-  ]);
-  return { poseLandmarker, handLandmarker };
+  ];
+  // Each ROI crop is a separate small image, not a continuation of a video
+  // stream — VIDEO mode would try to track between left-crop and right-crop
+  // calls and get confused.
+  //
+  // 0.4 confidence is a deliberate compromise. Lower (e.g. 0.2) lets noisy
+  // detections through — they pass to the smoother and then "hold-last"
+  // keeps the noise visible. Higher (e.g. 0.6) drops too many partly-closed
+  // fists/gloves that still have valid finger orientation. 0.4 keeps the
+  // detector firing on real hands while rejecting the worst outliers.
+  if (opts.handMode === "image") {
+    tasks.push(HandLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: HAND_MODEL, delegate: "GPU" },
+      runningMode: "IMAGE",
+      numHands: 1,                 // one hand per ROI crop
+      minHandDetectionConfidence: 0.4,
+      minHandPresenceConfidence:  0.4,
+    }));
+  }
+  const results = await Promise.all(tasks);
+  return {
+    poseLandmarker: results[0] as PoseLandmarker,
+    handLandmarker: results[1] as HandLandmarker,
+    handLandmarkerImage: results[2] as HandLandmarker | undefined,
+  };
 }

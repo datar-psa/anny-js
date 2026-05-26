@@ -10,7 +10,7 @@ export {
   forwardKinematics, allocBoneTransforms,
   identityDeltas, setDelta, setDeltas, buildBoneIndex,
 } from "./fk.js";
-export { lbs, allocVertexBuffer } from "./lbs.js";
+export { lbs, allocVertexBuffer, allocNormalBuffer } from "./lbs.js";
 export { renderAnny } from "./render2d.js";
 export type { RenderOptions } from "./render2d.js";
 // Rotation builders + the two 4×4 utilities anyone is likely to want.

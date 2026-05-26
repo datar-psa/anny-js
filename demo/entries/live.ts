@@ -2,8 +2,9 @@
 
 import {
   loadAnnyModel, buildBoneIndex, allocBoneTransforms,
-  lbs, allocVertexBuffer, forwardKinematics,
+  lbs, allocVertexBuffer, allocNormalBuffer, forwardKinematics,
 } from "../../src/anny/index.js";
+import type { PoseDeltas } from "../../src/anny/index.js";
 import { landmarksToPoseDeltas, assignHands } from "../../src/mediapipe/index.js";
 import type { Landmark, WorldLandmark } from "../../src/mediapipe/index.js";
 
@@ -33,6 +34,7 @@ statusEl.textContent = `Anny loaded ${(performance.now() - t0).toFixed(0)} ms �
 const boneIndex  = buildBoneIndex(model);
 const boneXforms = allocBoneTransforms(model.boneCount);
 const vertBuf    = allocVertexBuffer(model);
+const nrmBuf     = allocNormalBuffer(model);
 const restMinZ   = minRestZ(model);
 
 // ── 2. MediaPipe ────────────────────────────────────────────────────────
@@ -71,6 +73,7 @@ let smoothRightHand: WorldLandmark[] | null = null;
 let lastHandRes: { landmarks: Landmark[][]; worldLandmarks: WorldLandmark[][] } | null = null;
 let handFrame = 0;
 let lastTs = -1;
+let lastDeltas: PoseDeltas | null = null;
 let frameCount = 0, fpsTs = performance.now(), fps = 0;
 
 const LM_S = 0.5;     // pose body smoothing
@@ -99,6 +102,8 @@ function tick(): void {
       smoothWorldLm = smoothLandmarks(smoothWorldLm, poseRes.worldLandmarks[0], LM_S);
 
       const hr = lastHandRes ?? { landmarks: [], worldLandmarks: [] };
+      // Anatomical L/R from pose wrists (idx 15/16) — see assignHands docs
+      // for why this is more reliable than the hand-landmarker's handedness.
       const { leftHand: lH, rightHand: rH } = assignHands(
         hr.landmarks, hr.worldLandmarks, smoothImageLm,
       );
@@ -128,9 +133,13 @@ function tick(): void {
     pose:      smoothWorldLm,
     leftHand:  smoothLeftHand  ?? undefined,
     rightHand: smoothRightHand ?? undefined,
+    // Hold last good pose when MP visibility dips below threshold so limbs
+    // don't snap to spine during brief occlusions.
+    previousDeltas: lastDeltas ?? undefined,
   }, model, boneIndex);
+  lastDeltas = deltas;
   forwardKinematics(model, deltas, boneXforms);
-  const mesh = lbs(model, boneXforms, vertBuf);
+  const mesh = lbs(model, boneXforms, vertBuf, nrmBuf);
   const poseMs = (performance.now() - t1).toFixed(1);
 
   // ── Screen position from image-space pose ──
@@ -149,6 +158,7 @@ function tick(): void {
   const q = computeQuadrants(W, H, sScale, restMinZ);
   const views = buildFourViews(q);
   gl.uploadVertices(mesh.vertices);
+  gl.uploadNormals(mesh.normals);
   gl.clear();
   gl.setWorldTwist(0);
   drawFourViews(gl, views);

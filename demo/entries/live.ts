@@ -79,6 +79,11 @@ let frameCount = 0, fpsTs = performance.now(), fps = 0;
 
 const LM_S = 0.5;     // pose body smoothing
 const HAND_S = 0.6;   // hand smoothing
+// Keep a lost hand's last pose for a few detections before releasing it.
+// Dropping it at once makes the palm snap: the forearm's pronation comes
+// from the hand, so the arm untwists the moment the hand blinks out.
+const HAND_HOLD = 10;
+let missL = 0, missR = 0;
 const SMOOTH = 0.25;  // screen-space placement smoothing
 
 let sCx = W / 2, sScale = 280, sFootY = H * 0.88;
@@ -111,8 +116,10 @@ function tick(): void {
           video.videoWidth, video.videoHeight, smoothImageLm,
         )
         : {};
-      smoothLeftHand  = lH ? smoothLandmarks(smoothLeftHand,  lH, HAND_S) : null;
-      smoothRightHand = rH ? smoothLandmarks(smoothRightHand, rH, HAND_S) : null;
+      missL = lH ? 0 : missL + 1;
+      missR = rH ? 0 : missR + 1;
+      smoothLeftHand  = lH ? smoothLandmarks(smoothLeftHand,  lH, HAND_S) : missL > HAND_HOLD ? null : smoothLeftHand;
+      smoothRightHand = rH ? smoothLandmarks(smoothRightHand, rH, HAND_S) : missR > HAND_HOLD ? null : smoothRightHand;
     }
   }
 

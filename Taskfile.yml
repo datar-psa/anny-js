@@ -28,26 +28,39 @@ tasks:
     cmds: [bunx tsc --noEmit -p tsconfig.check.json]
 
   test:
-    desc: Run all tests (unit + parity)
+    desc: Run unit + parity tests (fast, no browser)
     cmds: [bun test]
+
+  assets:
+    desc: Download MediaPipe models + MediaPipe's test photos into .cache/ (idempotent)
+    cmds: [bun tools/fetch_assets.ts]
+
+  test:browser:
+    desc: "Headless Chromium regression gates: real MediaPipe on synthetic hands, photos, demo clips (~1 min)"
+    deps: [assets]
+    env:
+      ANNY_BROWSER: "1"
+    cmds: [bun test tests/browser]
+
+  validate:
+    desc: "Round trip (image → MediaPipe → Anny → render → MediaPipe) + synthetic ground truth; HTML reports in .cache/"
+    deps: [assets]
+    cmds:
+      - bun tools/synthetic.ts --random 60
+      - bun tools/roundtrip.ts --set all --frames 12
 
   clean:
     desc: Remove build output
     cmds: [rm -rf dist/ dist-demo/]
 
   demo:
-    desc: Serve demos via Vite dev server at http://localhost:3000 (HMR enabled)
+    desc: Serve demos via Vite dev server at http://localhost:3000 (HMR enabled; add ?mp=local to load MediaPipe from node_modules + .cache)
     cmds: [bunx vite]
 
   fixtures:
     desc: "Regenerate Python-anny parity fixtures (needs body-tuning venv active)"
     cmds:
       - python tools/gen_parity_fixtures.py
-
-  fixtures:landmarks:
-    desc: "Capture MediaPipe landmark fixtures from demo videos (needs `task demo` running)"
-    cmds:
-      - bun tools/capture_landmarks.ts
 
   # ── Versioning (package.json as single source of truth) ────────────────────
 

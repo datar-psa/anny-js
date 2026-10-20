@@ -20,11 +20,17 @@ export interface WorldLandmark {
 
 /** Input bundle for the driver. */
 export interface PoseInput {
-  /** 33 MediaPipe Pose worldLandmarks (metric, hip-centered). Required. */
-  pose: WorldLandmark[];
-  /** 21 MediaPipe Hand worldLandmarks for the left hand. Optional. */
+  /**
+   * 33 MediaPipe Pose worldLandmarks (metric, hip-centered). Drives trunk,
+   * head and limbs. Optional: hands alone still pose the hand in world.
+   */
+  pose?: WorldLandmark[];
+  /**
+   * 21 MediaPipe Hand worldLandmarks for the subject's anatomical LEFT hand.
+   * Route detections by anatomy (e.g. `assignHands`), not by position.
+   */
   leftHand?: WorldLandmark[];
-  /** 21 MediaPipe Hand worldLandmarks for the right hand. Optional. */
+  /** 21 MediaPipe Hand worldLandmarks for the anatomical RIGHT hand. */
   rightHand?: WorldLandmark[];
   /**
    * Flip Anny X axis. Only set true if your upstream is already mirrored.
@@ -34,9 +40,9 @@ export interface PoseInput {
   /** Minimum landmark visibility to drive a bone (default 0.5). */
   visibilityMin?: number;
   /**
-   * Maximum delta rotation angle per bone in radians, applied to `dir`
-   * targets only. Bounds the damage a single bad landmark can do.
-   * Default 2.5 rad (~143°).
+   * Maximum delta rotation angle per limb bone, radians. Bounds the damage a
+   * single bad landmark can do. Default π (no limit beyond the anatomical
+   * joint limits the driver always applies).
    */
   maxAngleRad?: number;
   /**

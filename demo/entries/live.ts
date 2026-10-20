@@ -5,11 +5,12 @@ import {
   lbs, allocVertexBuffer, allocNormalBuffer, forwardKinematics,
 } from "../../src/anny/index.js";
 import type { PoseDeltas } from "../../src/anny/index.js";
-import { landmarksToPoseDeltas, assignHands } from "../../src/mediapipe/index.js";
+import { handsForDriver, landmarksToPoseDeltas } from "../../src/mediapipe/index.js";
 import type { Landmark, WorldLandmark } from "../../src/mediapipe/index.js";
+import type { HandLandmarkerResult } from "@mediapipe/tasks-vision";
 
 import { setupWebGL, minRestZ } from "../_shared/webgl.js";
-import { createMediaPipe } from "../_shared/mediapipe-loader.js";
+import { createMediaPipe, mediaPipeAssetsFromQuery } from "../_shared/mediapipe-loader.js";
 import { smoothLandmarks } from "../_shared/smoothing.js";
 import { createCanvasRecorder } from "../_shared/recorder.js";
 import { computeQuadrants, buildFourViews, drawFourViews, drawDividers } from "../_shared/multi-view.js";
@@ -38,7 +39,7 @@ const nrmBuf     = allocNormalBuffer(model);
 const restMinZ   = minRestZ(model);
 
 // ── 2. MediaPipe ────────────────────────────────────────────────────────
-const { poseLandmarker, handLandmarker } = await createMediaPipe();
+const { poseLandmarker, handLandmarker } = await createMediaPipe(mediaPipeAssetsFromQuery());
 statusEl.textContent = "MediaPipe ready — requesting camera…";
 
 // ── 3. Webcam ───────────────────────────────────────────────────────────
@@ -70,7 +71,7 @@ let smoothImageLm: Landmark[] | null = null;
 let smoothWorldLm: WorldLandmark[] | null = null;
 let smoothLeftHand: WorldLandmark[] | null = null;
 let smoothRightHand: WorldLandmark[] | null = null;
-let lastHandRes: { landmarks: Landmark[][]; worldLandmarks: WorldLandmark[][] } | null = null;
+let lastHandRes: HandLandmarkerResult | null = null;
 let handFrame = 0;
 let lastTs = -1;
 let lastDeltas: PoseDeltas | null = null;
@@ -101,12 +102,15 @@ function tick(): void {
       smoothImageLm = smoothLandmarks(smoothImageLm, lastImageLm, LM_S);
       smoothWorldLm = smoothLandmarks(smoothWorldLm, poseRes.worldLandmarks[0], LM_S);
 
-      const hr = lastHandRes ?? { landmarks: [], worldLandmarks: [] };
-      // Anatomical L/R from pose wrists (idx 15/16) — see assignHands docs
-      // for why this is more reliable than the hand-landmarker's handedness.
-      const { leftHand: lH, rightHand: rH } = assignHands(
-        hr.landmarks, hr.worldLandmarks, smoothImageLm,
-      );
+      // Anatomical side from the pose wrists, 3D from the image landmarks,
+      // chirality matched to the side — see `handsForDriver`.
+      const hr = lastHandRes;
+      const { leftHand: lH, rightHand: rH } = hr
+        ? handsForDriver(
+          { landmarks: hr.landmarks, handedness: hr.handedness.map(h => h[0]?.categoryName ?? "") },
+          video.videoWidth, video.videoHeight, smoothImageLm,
+        )
+        : {};
       smoothLeftHand  = lH ? smoothLandmarks(smoothLeftHand,  lH, HAND_S) : null;
       smoothRightHand = rH ? smoothLandmarks(smoothRightHand, rH, HAND_S) : null;
     }

@@ -5,7 +5,7 @@
 Two pillars:
 
 1. **Anny in the browser.** The canonical Anny package is Python + PyTorch. `anny-js` ports the runtime — forward kinematics and linear blend skinning over a 13 718-vertex / 163-bone mesh — to TypeScript, with no Python, no native modules, no server. The implementation is parity-tested against the reference Python `anny`: bone transforms agree within 1e-5, vertices within 0.1 mm.
-2. **MediaPipe → Anny.** A driver that turns 33 pose landmarks + 21×2 hand landmarks per frame into per-bone rotation deltas — parent-corrected so child bones see the true parent rotation, angle-clamped so a single bad landmark doesn't crumple the rig, and bundled with proximity-based left/right hand assignment.
+2. **MediaPipe → Anny.** A driver that turns 33 pose landmarks + 21×2 hand landmarks per frame into per-bone rotations under the rig's own joint model — elbows, knees and every finger joint bend only about their hinge axes, the palm's roll goes into the forearm, and anatomical limits bound bad landmarks. It is validated end-to-end by rendering the driven body and running MediaPipe on the render again (see [Validation](#validating-the-mediapipe-driver)).
 
 End-to-end (MediaPipe pose → posed mesh) is **< 6 ms** on integrated GPU. The library itself is a 1.4 MB binary asset + ~15 KB of TypeScript.
 
@@ -99,37 +99,39 @@ Hot loops can skip the `Pose` wrapper entirely and use the underlying functional
 
 ---
 
-## Quick start — drive from MediaPipe Pose
+## Quick start — drive from MediaPipe Pose + Hands
 
 ```ts
 import {
   loadAnnyModel,
   allocBoneTransforms, lbs, allocVertexBuffer, forwardKinematics,
 } from 'anny-js/anny';
-import { landmarksToPoseDeltas } from 'anny-js/mediapipe';
+import { landmarksToPoseDeltas, handsForDriver } from 'anny-js/mediapipe';
 
 const model     = await loadAnnyModel('/anny_model.json', '/anny_model.bin');
 const boneXf    = allocBoneTransforms(model.boneCount);
 const vertBuf   = allocVertexBuffer(model);
 
-// In your MediaPipe Pose detection loop:
-function onLandmarks(landmarks) {         // 33 × {x,y,z,visibility}
-  const deltas = landmarksToPoseDeltas({ pose: landmarks }, model);
+// Per frame, with PoseLandmarker + HandLandmarker results on a W×H frame:
+function onFrame(poseRes, handRes, W, H) {
+  const hands = handsForDriver(
+    { landmarks: handRes.landmarks, handedness: handRes.handedness.map(h => h[0].categoryName) },
+    W, H, poseRes.landmarks[0],          // pose image landmarks → anatomical L/R
+  );
+  const deltas = landmarksToPoseDeltas({ pose: poseRes.worldLandmarks[0], ...hands }, model);
   forwardKinematics(model, deltas, boneXf);
   const { vertices, faces } = lbs(model, boneXf, vertBuf);
   // → feed into WebGL / Three.js / your renderer
 }
 ```
 
-See [`demo/live.html`](demo/live.html) for the full 4-view WebGL demo with recording.
-
-> **Hands:** pose tracking is solid; per-finger hand tracking from full-body
-> footage is unreliable (the hand is a few % of frame) and is **disabled by
-> default** in the video demo. The whole hand pipeline is kept intact and
-> re-enables with one flag. The investigation — MediaPipe's hand-local
-> coordinate frame, the rig's palmar/dorsal convention, the natural curl
-> synergy, and how to verify hands numerically — is written up in
-> [`docs/hand-tracking.md`](docs/hand-tracking.md).
+`handsForDriver` assigns each detected hand to the subject's anatomical side,
+lifts MediaPipe's **image** landmarks to 3D (measurably more accurate than its
+`worldLandmarks`) and repairs MediaPipe's occasional left/right chirality slip.
+Hands are optional, and work without a pose too. See [`demo/live.html`](demo/live.html)
+for the full 4-view WebGL demo with recording, and
+[`docs/hand-tracking.md`](docs/hand-tracking.md) for what was measured and why
+the driver is built the way it is.
 
 ---
 
@@ -141,7 +143,7 @@ Three demos, each isolating one capability:
 |--|------|----------------------|
 | 🎬 | [`demo/anim.html`](demo/anim.html) | **The Anny runtime, no MediaPipe.** A procedural backflip drives the rig directly with rotation matrices — proves FK + LBS work in the browser at 30 fps with 4 simultaneous camera views. No webcam, no inference. |
 | 📷 | [`demo/live.html`](demo/live.html) | **Anny + MediaPipe, live.** Your webcam → MediaPipe Pose + Hand → Anny. All 163 bones (including 38 finger bones) drive in real time. 4-view WebGL render + WebM recorder. |
-| 🎞 | [`demo/video.html`](demo/video.html) | **Anny + MediaPipe, offline.** Same pipeline as `live`, but on bundled clips with MediaPipe's *heavy* pose model — useful for inspecting driver quality without webcam noise. |
+| 🎞 | [`demo/video.html`](demo/video.html) | **Anny + MediaPipe, offline.** Same pipeline as `live`, but on bundled clips with MediaPipe's *heavy* pose model and per-wrist ROI hand crops (far-away hands). `?clip=<url>` plays your own clip; `?mp=local` loads MediaPipe from local files. |
 
 **Run locally:**
 
@@ -150,6 +152,9 @@ git clone https://github.com/datar-psa/anny-js
 cd anny-js && bun install
 bun run demo    # Vite dev server with HMR — http://localhost:3000
 ```
+
+**Tests:** `task test` (unit + Python parity, fast), `task test:browser`
+(headless MediaPipe regression gates), `task check` (typecheck).
 
 ---
 
@@ -203,14 +208,21 @@ setDelta(deltas, model, 'upperarm01.L', rot3x3Float32)
 setDeltas(deltas, model, [{ bone: 'spine01', rot }, ...])
 ```
 
-**From MediaPipe Pose landmarks** (parent-corrected, world-coord deltas):
+**From MediaPipe** (`anny-js/mediapipe`):
 
 ```ts
 landmarksToPoseDeltas(
-  input: PoseInput,                    // { pose, leftHand?, rightHand?, mirrorX?, visibilityMin?, maxAngleRad? }
+  input: PoseInput,       // { pose?, leftHand?, rightHand?, mirrorX?, visibilityMin?, maxAngleRad?, previousDeltas? }
   model: AnnyModel,
-  boneIndex?: Map<string, number>,     // optional — built on demand if omitted
 ): PoseDeltas
+
+// HandLandmarker result → { leftHand?, rightHand? } for PoseInput (recommended path)
+handsForDriver(det: { landmarks, handedness: string[] }, width, height, poseImage?)
+
+// The pieces handsForDriver is built from:
+handSides(handsImage, labels, poseImage?, width?, height?): ("L" | "R")[]
+handLandmarks3D(imageLandmarks, width, height): WorldLandmark[]   // camera-axis 3D
+matchHandChirality(world, side, label): WorldLandmark[]           // fix a chirality slip
 ```
 
 ---
@@ -280,7 +292,31 @@ source /path/to/vton-exp/hmr/body-tuning/venv/bin/activate
 task fixtures   # → tests/parity/fixtures/*.json
 ```
 
-The MediaPipe driver has its own parity test ([`tests/mediapipe/landmarks-parity.test.ts`](tests/mediapipe/landmarks-parity.test.ts)) that compares each posed bone's axis against the MediaPipe-derived direction. It runs on synthetic A-pose landmarks (mean error must stay < 0.5°) and on optional video-captured fixtures (regenerate via `task fixtures:landmarks`).
+---
+
+## Validating the MediaPipe driver
+
+Three independent loops (details and numbers in [`docs/hand-tracking.md`](docs/hand-tracking.md)):
+
+1. **IK recovery** (`bun test`): pose the rig with known random deltas, emit
+   the landmarks MediaPipe would ideally report, drive, compare — limbs, head
+   and palm recover to < 0.5°, finger joints to ~1°.
+2. **Synthetic ground truth** (`bun tools/synthetic.ts`): render known hand
+   poses, run real MediaPipe on the render, drive from its reading, compare
+   with the known pose.
+3. **Round trip** (`bun tools/roundtrip.ts`): photo/video frame → MediaPipe →
+   driven Anny → render → MediaPipe again, compared with view-invariant
+   metrics (signed finger flexion, palm orientation, limb directions, 2D
+   landmark residual). HTML report with overlays in `.cache/roundtrip/`.
+
+Loops 2 and 3 run real MediaPipe (wasm, CPU) in headless Chromium with
+SwiftShader WebGL — no GPU, no CDN at test time:
+
+```bash
+task assets          # MediaPipe models + MediaPipe's test photos → .cache/
+task test:browser    # regression gates (~1 min)
+task validate        # full reports
+```
 
 ---
 

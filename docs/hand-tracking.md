@@ -43,7 +43,9 @@ Measured on all ten MediaPipe test photos: the in-plane rotation between each
 hand's world landmarks (x, y) and its image landmarks is −8°…+4°, and world z
 correlates 0.9+ with image z. The landmarks are in camera axes — exactly what
 `world_landmark_projection_calculator.cc` does (it undoes the crop's in-plane
-rotation). The re-alignment was not just unnecessary but harmful: it flipped
+rotation). Pose world landmarks are camera-aligned the same way (−1.7°…+1.3°
+on eleven full-body images), so pose and hand landmarks share one frame. The
+re-alignment was not just unnecessary but harmful: it flipped
 its Z axis per frame depending on which side of the palm the pose's noisy
 thumb point fell, producing an improper (mirroring) rotation — a mirrored
 hand is precisely "fingers bending backward".

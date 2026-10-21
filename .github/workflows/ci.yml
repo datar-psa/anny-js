@@ -8,9 +8,9 @@
 #
 # Deploys and publishes use the exact demo build / commit the tests passed on.
 # No stored credentials:
-#   • GCP via Workload Identity Federation (clad: ops/gcp/github). Repository
-#     variables GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_DEPLOY_SERVICE_ACCOUNT
-#     hold its outputs (identifiers, not secrets).
+#   • GCP via Workload Identity Federation (clad: ops/gcp/github). Its two
+#     outputs are identifiers, not secrets, so they live in `env` below
+#     (repository variables of the same name override them).
 #   • npm via trusted publishing (OIDC), configured on npmjs.com for this
 #     workflow file and the `npm` environment.
 # Same-repo PRs are covered by the branch push; the pull_request trigger only
@@ -36,6 +36,8 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 env:
+  GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER || 'projects/705908219344/locations/global/workloadIdentityPools/github/providers/github-actions' }}
+  GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT || 'anny-js-deploy@clad-main.iam.gserviceaccount.com' }}
   BUN_VERSION: 1.4.2
   NODE_VERSION: 22
   FIREBASE_TOOLS: firebase-tools@15.32.1
@@ -105,11 +107,10 @@ jobs:
           ANNY_BROWSER: "1"
 
   preview:
-    # Every branch push except main. Skipped (not failed) until the WIF
-    # variables exist, so forks and fresh clones stay green.
+    # Every branch push except main.
     if: >-
       github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') &&
-      github.ref != 'refs/heads/main' && vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+      github.ref != 'refs/heads/main'
     needs: [check, browser]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -133,8 +134,8 @@ jobs:
           package-manager-cache: false
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_DEPLOY_SERVICE_ACCOUNT }}
       - name: Deploy preview channel
         id: deploy
         env:
@@ -165,15 +166,6 @@ jobs:
       group: anny-js-production
       cancel-in-progress: false
     steps:
-      - name: Require deploy configuration
-        env:
-          WIF: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          SA: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
-        run: |
-          [ -n "$WIF" ] && [ -n "$SA" ] || {
-            echo "::error::Set repository variables GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_DEPLOY_SERVICE_ACCOUNT (outputs of clad ops/gcp/github)."
-            exit 1
-          }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -187,8 +179,8 @@ jobs:
           package-manager-cache: false
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_DEPLOY_SERVICE_ACCOUNT }}
       - name: Deploy anny-js.clad.you
         run: |
           npx --yes "$FIREBASE_TOOLS" deploy --only hosting --project "$FIREBASE_PROJECT" \
@@ -196,9 +188,7 @@ jobs:
 
   preview-cleanup:
     # Branch deleted → drop its preview channel (they also expire on their own).
-    if: >-
-      github.event_name == 'delete' && github.event.ref_type == 'branch' &&
-      vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+    if: github.event_name == 'delete' && github.event.ref_type == 'branch'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -214,8 +204,8 @@ jobs:
           package-manager-cache: false
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_DEPLOY_SERVICE_ACCOUNT }}
       - name: Delete preview channel
         env:
           BRANCH: ${{ github.event.ref }}

@@ -339,16 +339,13 @@ is npm (trusted publishing).
 
 **One-time setup**
 
-1. In clad: `task tf-gcp-org` (enables the IAM/STS APIs), then `task tf-gcp-github`.
-2. Repository variables (Settings → Secrets and variables → Actions → *Variables*)
-   from `tofu -chdir=ops/gcp/github output`:
-   `GCP_WORKLOAD_IDENTITY_PROVIDER` ← `workload_identity_provider`,
-   `GCP_DEPLOY_SERVICE_ACCOUNT` ← `anny_js_deploy_service_account`.
-   Until they're set, previews are skipped and `main` deploys fail loudly.
-3. npmjs.com → `anny-js` → Settings → Trusted Publisher → GitHub Actions:
+1. In clad: `task tf-gcp-org` (enables the IAM/STS APIs) and `task tf-gcp-github`.
+   *(Applied 2026-10-21; the provider and service account are in the
+   workflow's `env`. Repository variables of the same names override them.)*
+2. npmjs.com → `anny-js` → Settings → Trusted Publisher → GitHub Actions:
    organization `datar-psa`, repository `anny-js`, workflow `ci.yml`,
    environment `npm`. Then disallow token publishing for the package.
-4. Optional but recommended: protect the `production` and `npm` environments
+3. Optional but recommended: protect the `production` and `npm` environments
    (deployment branches `main` / tags `anny-js/v*`, required reviewers).
 
 Releasing: on an up-to-date `main`, `task ship` (or `BUMP=minor task ship`)

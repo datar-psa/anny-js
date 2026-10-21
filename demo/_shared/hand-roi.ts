@@ -11,7 +11,9 @@
  * detection succeeds, and we map the image-space landmarks back to full-frame
  * coords. World-space hand landmarks pass through unchanged — they're metric
  * vectors relative to the wrist in the same world frame as the pose, and the
- * crop is a 2D image transformation that doesn't affect 3D directions.
+ * crop is a 2D image transformation that doesn't affect 3D directions. Image
+ * landmarks are mapped back to full-frame coordinates — including z, which
+ * MediaPipe expresses in units of the *input* width and must be rescaled.
  *
  * Why a separate IMAGE-mode HandLandmarker: VIDEO mode keeps inter-frame
  * tracking state. If we feed it left-crop then right-crop in the same frame
@@ -21,22 +23,7 @@
 
 import type { HandLandmarker, HandLandmarkerResult, NormalizedLandmark } from "@mediapipe/tasks-vision";
 
-import type { Landmark, WorldLandmark } from "../../src/mediapipe/index.js";
-
-/**
- * ROI detection result, indexed by anatomical side.
- *
- * Side comes from MediaPipe's own `result.handedness` label, not from which
- * crop the detection came from. The HandLandmarker model classifies a hand
- * as Left or Right by anatomy (thumb side, finger geometry), which is
- * robust to the boxing-guard case where the two crops overlap and either
- * crop can capture either hand. Crop-source labelling was wrong whenever
- * the right-wrist crop happened to contain more of the left hand.
- */
-export interface RoiHandResult {
-  leftHand?:  { image: Landmark[]; world: WorldLandmark[] };
-  rightHand?: { image: Landmark[]; world: WorldLandmark[] };
-}
+import type { HandDetections, Landmark } from "../../src/mediapipe/index.js";
 
 export interface HandRoiOptions {
   /**
@@ -57,8 +44,8 @@ interface CropSpec {
   /** Pose's knuckle landmark indices for the same hand — used to centre the crop on
    *  the actual hand region (the wrist alone biases the crop into the forearm). */
   knuckles: readonly number[];
-  /** Which side of the body this crop is positioned on (informational, used only
-   *  for debug/dedup tie-breaking; NOT used to assign anatomical handedness). */
+  /** Which pose wrist this crop is centred on (debug only — anatomical sides
+   *  are assigned by `handsForDriver`). */
   side: "L" | "R";
 }
 
@@ -76,57 +63,6 @@ function avg(lms: ReadonlyArray<Landmark>, k: "x" | "y"): number {
   return s / lms.length;
 }
 
-// Five wrist→knuckle directions that characterise the hand's overall pose.
-// Used by `isHandOutlier` to spot noisy detections — they tend to splay one
-// finger wildly while the others stay still, so a large angular delta on any
-// of these signals "this is noise, not real motion".
-//   thumb_CMC (1), index_MCP (5), middle_MCP (9), ring_MCP (13), pinky_MCP (17)
-const HAND_DIR_TARGETS = [1, 5, 9, 13, 17] as const;
-
-function angleDeg(ax: number, ay: number, az: number, bx: number, by: number, bz: number): number {
-  const aLen = Math.hypot(ax, ay, az) || 1;
-  const bLen = Math.hypot(bx, by, bz) || 1;
-  const dot  = (ax*bx + ay*by + az*bz) / (aLen * bLen);
-  return Math.acos(Math.max(-1, Math.min(1, dot))) * 180 / Math.PI;
-}
-
-/**
- * Decide whether `fresh` is too far from `prev` to be a plausible next frame.
- *
- * Compares the wrist→knuckle direction for five fingers; if the *max* angular
- * delta across them exceeds `maxAngleDeg`, treat `fresh` as a noisy detection
- * and reject it (the caller should hold the previous smoothed pose instead).
- *
- * `prev` null means "no history yet" — always accept the first detection.
- *
- * Why max rather than mean: real hand motion moves fingers together (all
- * fingers swing through similar deltas during a wave or punch). Noise typically
- * jerks one or two fingers far while the others stay put — the max delta
- * captures that asymmetry, while a mean would average it away.
- */
-export function isHandOutlier(
-  prev: ReadonlyArray<WorldLandmark> | null,
-  fresh: ReadonlyArray<WorldLandmark>,
-  maxAngleDeg = 60,
-): boolean {
-  if (!prev || prev.length === 0) return false;
-  const wF = fresh[0], wP = prev[0];   // MP_HAND.WRIST = 0
-  if (!wF || !wP) return false;
-
-  let maxDelta = 0;
-  for (const k of HAND_DIR_TARGETS) {
-    const f = fresh[k], p = prev[k];
-    if (!f || !p) continue;
-    const d = angleDeg(
-      f.x - wF.x, f.y - wF.y, f.z - wF.z,
-      p.x - wP.x, p.y - wP.y, p.z - wP.z,
-    );
-    if (d > maxDelta) maxDelta = d;
-    if (maxDelta > maxAngleDeg) return true;   // early out
-  }
-  return false;
-}
-
 /** Lightweight debug record so callers (Playwright/devtools) can see what the ROI did. */
 export interface HandRoiDebug {
   /** Per-wrist: did we attempt a crop, did the detector find a hand. */
@@ -136,14 +72,8 @@ export interface HandRoiDebug {
 }
 
 /**
- * ROI hand detector. Construct once, call `detect()` per frame.
- *
- * Returns hands keyed by their anatomical side, derived from the source crop
- * — the L-crop is centred on pose's `LEFT_WRIST` so any hand it produces is
- * the anatomical left hand. This bypasses the image-space proximity
- * disambiguation that `assignHands` would otherwise perform, which is
- * critical when the two crops overlap (boxing guard, hands clasped, etc.):
- * proximity would gladly pair the same physical hand with both sides.
+ * ROI hand detector. Construct once, call `detect()` per frame; feed the
+ * result to `handsForDriver` together with the pose's image landmarks.
  */
 export class HandRoiDetector {
   private off: HTMLCanvasElement;
@@ -172,8 +102,8 @@ export class HandRoiDetector {
    *                   wrist→knuckle distance. Pass the *smoothed* landmarks
    *                   so the crop is stable across frames.
    */
-  detect(video: HTMLVideoElement, poseImgLm: Landmark[]): RoiHandResult {
-    const out: RoiHandResult = {};
+  detect(video: HTMLVideoElement, poseImgLm: Landmark[]): HandDetections {
+    const out: HandDetections = { landmarks: [], handedness: [] };
 
     const vW = video.videoWidth  || 0;
     const vH = video.videoHeight || 0;
@@ -187,23 +117,6 @@ export class HandRoiDetector {
       ? Math.hypot(lSh.x - rSh.x, lSh.y - rSh.y)
       : 0.3;
     const fallbackPx = Math.max(vW, vH) * shoulderWidthNorm * this.cropSizeRatio;
-
-    // Run both crops, then assign each detection to anatomical L or R by
-    // comparing the detected hand's image-space wrist to pose's LEFT_WRIST
-    // (15) and RIGHT_WRIST (16). Pose labels are anatomical and unambiguous
-    // — far more reliable than the hand-landmarker's handedness, which
-    // assumes a mirrored input image (see MP docs) and silently inverts on
-    // most real footage.
-    interface Detection {
-      image: Landmark[];
-      world: WorldLandmark[];
-      dL: number;           // distance from detected wrist to pose LEFT_WRIST
-      dR: number;           // distance from detected wrist to pose RIGHT_WRIST
-      cropSide: "L" | "R";  // debug only
-    }
-    const detections: Detection[] = [];
-    const poseL = poseImgLm[15];
-    const poseR = poseImgLm[16];
 
     this.lastDebug.attempts = [];
     for (const c of CROPS) {
@@ -230,40 +143,20 @@ export class HandRoiDetector {
       const cropPx    = Math.max(96, knucklePx, fallbackPx);
 
       const result = this.detectOnCrop(video, cxNorm, cyNorm, cropPx, vW, vH);
-      this.lastDebug.attempts.push({
-        side: c.side, cropPx, wristVis, found: !!result,
-      });
+      this.lastDebug.attempts.push({ side: c.side, cropPx, wristVis, found: !!result });
       if (!result) continue;
 
-      const hw = result.imageLm[0];
-      const dL = poseL ? Math.hypot(hw.x - poseL.x, hw.y - poseL.y) : Infinity;
-      const dR = poseR ? Math.hypot(hw.x - poseR.x, hw.y - poseR.y) : Infinity;
-      detections.push({
-        image: result.imageLm, world: result.worldLm, dL, dR, cropSide: c.side,
-      });
+      // Overlapping crops (hands together) can both find the same hand: keep
+      // a second detection only if its wrist is clearly elsewhere.
+      const dup = out.landmarks.some(prev =>
+        Math.hypot((prev[0].x - result.imageLm[0].x) * vW, (prev[0].y - result.imageLm[0].y) * vH)
+          < 0.15 * shoulderWidthNorm * Math.max(vW, vH));
+      if (dup) continue;
+      out.landmarks.push(result.imageLm);
+      out.handedness.push(result.label);
     }
-
-    // Two-hand case: bipartite match — pick the assignment (detection 0→L,
-    // detection 1→R) vs (0→R, 1→L) that minimises the sum of distances.
-    // This handles the boxing-guard case where both crops capture either
-    // hand: pose's anatomical wrists pull each detection to its real side.
-    if (detections.length >= 2) {
-      const a = detections[0], b = detections[1];
-      const costAR = a.dL + b.dR;
-      const costAL = a.dR + b.dL;
-      if (costAR <= costAL) {
-        out.leftHand  = { image: a.image, world: a.world };
-        out.rightHand = { image: b.image, world: b.world };
-      } else {
-        out.rightHand = { image: a.image, world: a.world };
-        out.leftHand  = { image: b.image, world: b.world };
-      }
-    } else if (detections.length === 1) {
-      const d = detections[0];
-      const slot = { image: d.image, world: d.world };
-      if (d.dL <= d.dR) out.leftHand  = slot;
-      else              out.rightHand = slot;
-    }
+    // Anatomical sides are assigned downstream by `handsForDriver`, from the
+    // pose's own wrists — not from which crop a hand came out of.
     return out;
   }
 
@@ -275,7 +168,7 @@ export class HandRoiDetector {
     cropPx: number,
     vW: number,
     vH: number,
-  ): { imageLm: Landmark[]; worldLm: WorldLandmark[] } | null {
+  ): { imageLm: Landmark[]; label: string } | null {
     const cx = cxNorm * vW;
     const cy = cyNorm * vH;
     const half = cropPx / 2;
@@ -299,19 +192,17 @@ export class HandRoiDetector {
 
     if (!res.landmarks || res.landmarks.length === 0) return null;
     // numHands: 1 in this detector, so res.landmarks[0] is the only hand.
-    const handImg   = res.landmarks[0];
-    const handWorld = res.worldLandmarks[0];
+    const handImg = res.landmarks[0];
 
-    // Map image-space landmarks (which are normalised to the 256×256 crop)
-    // back to the full video frame's normalised coords.
+    // Map crop-normalised landmarks back to the full frame. z is relative
+    // depth in units of the crop width; re-express it in frame-width units
+    // like x so `handLandmarks3D` scales it correctly.
     const mapped = handImg.map((lm: NormalizedLandmark): Landmark => ({
       x: (sx + lm.x * cropPx) / vW,
       y: (sy + lm.y * cropPx) / vH,
-      z: lm.z,
+      z: lm.z * cropPx / vW,
       visibility: lm.visibility,
     }));
-
-    // worldLandmarks are metric, wrist-origin, in the camera frame — no remap.
-    return { imageLm: mapped, worldLm: handWorld };
+    return { imageLm: mapped, label: res.handedness[0]?.[0]?.categoryName ?? "" };
   }
 }

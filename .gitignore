@@ -12,3 +12,4 @@ tools/venv/
 # Captured landmark fixtures are regeneratable via `task fixtures:landmarks`.
 # Keep small commits — large MP4-derived JSONs hurt git size.
 tests/mediapipe/fixtures/*_landmarks.json
+.cache/

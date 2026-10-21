@@ -1,17 +1,17 @@
 /** Pre-recorded video → MediaPipe (heavy) → Anny demo with a fixture picker. */
 
 import {
-  loadAnnyModel, buildBoneIndex, allocBoneTransforms,
+  loadAnnyModel, allocBoneTransforms,
   lbs, allocVertexBuffer, allocNormalBuffer, forwardKinematics,
 } from "../../src/anny/index.js";
 import type { PoseDeltas } from "../../src/anny/index.js";
-import { landmarksToPoseDeltas } from "../../src/mediapipe/index.js";
-import type { Landmark, WorldLandmark } from "../../src/mediapipe/index.js";
+import { handsForDriver, MP_HAND, PoseTracker } from "../../src/mediapipe/index.js";
+import type { DriverHands, HandDetections, Landmark, WorldLandmark } from "../../src/mediapipe/index.js";
 
 import { setupWebGL, minRestZ } from "../_shared/webgl.js";
-import { createMediaPipe } from "../_shared/mediapipe-loader.js";
+import { createMediaPipe, mediaPipeAssetsFromQuery } from "../_shared/mediapipe-loader.js";
 import { smoothLandmarks } from "../_shared/smoothing.js";
-import { HandRoiDetector, isHandOutlier } from "../_shared/hand-roi.js";
+import { HandRoiDetector } from "../_shared/hand-roi.js";
 import {
   computeQuadrants, buildFourViews, drawFourViews, drawDividers,
   buildSplitView, drawSplitView, drawSplitDivider,
@@ -38,11 +38,11 @@ let layout: Layout = "four";
 function setLayout(next: Layout): void {
   layout = next;
   document.body.classList.toggle("split-layout", next === "split");
-  for (const b of layoutEl.querySelectorAll("button")) {
+  for (const b of layoutEl.querySelectorAll("button[data-layout]")) {
     b.classList.toggle("active", (b as HTMLButtonElement).dataset.layout === next);
   }
 }
-for (const btn of layoutEl.querySelectorAll("button")) {
+for (const btn of layoutEl.querySelectorAll("button[data-layout]")) {
   btn.addEventListener("click", () => {
     setLayout((btn as HTMLButtonElement).dataset.layout as Layout);
   });
@@ -58,7 +58,6 @@ const t0 = performance.now();
 const model = await loadAnnyModel("/anny_model.json", "/anny_model.bin");
 statusEl.textContent = `Anny loaded ${(performance.now() - t0).toFixed(0)} ms — starting MediaPipe…`;
 
-const boneIndex  = buildBoneIndex(model);
 const boneXforms = allocBoneTransforms(model.boneCount);
 const vertBuf    = allocVertexBuffer(model);
 const nrmBuf     = allocNormalBuffer(model);
@@ -71,28 +70,33 @@ const restMinZ   = minRestZ(model);
 const { poseLandmarker, handLandmarkerImage } = await createMediaPipe({
   poseModel: "heavy",
   handMode:  "image",
+  ...mediaPipeAssetsFromQuery(),
 });
 const handRoi = new HandRoiDetector(handLandmarkerImage!);
 statusEl.textContent = "MediaPipe ready — loading video…";
 
 const gl = setupWebGL(glCanvas, model);
 
-// ── Smoothed state (declared up-front so loadFixture can reset on switch) ──
+// ── Tracking state (declared up-front so loadFixture can reset on switch) ──
+// The body pose is smoothed as landmarks; hands go raw into the tracker,
+// which filters them against its natural-hand prior (see PoseTracker).
+const tracker = new PoseTracker(model);
 let lastImageLm: Landmark[] | null = null;
 let smoothImageLm: Landmark[] | null = null;
 let smoothWorldLm: WorldLandmark[] | null = null;
-let smoothLeftHand: WorldLandmark[] | null = null;
-let smoothRightHand: WorldLandmark[] | null = null;
-let lastHandRes: import("../_shared/hand-roi.js").RoiHandResult | null = null;
+let lastHandDet: HandDetections | null = null;
+let handsSeen = "--";
 let handFrame = 0;
-let lastTs = -1;
+let lastVideoTime = -1;
 let lastDeltas: PoseDeltas | null = null;
+let poseMs = "0.0";
 
 async function loadFixture(src: string, label: string) {
   lastImageLm = smoothImageLm = smoothWorldLm = null;
-  smoothLeftHand = smoothRightHand = null;
-  lastHandRes = null;
+  lastHandDet = null;
   lastDeltas = null;
+  lastVideoTime = -1;
+  tracker.reset();
 
   video.src = src;
   await new Promise<void>(r => video.addEventListener("loadeddata", () => r(), { once: true }));
@@ -108,28 +112,28 @@ for (const btn of picker.querySelectorAll("button")) {
     await loadFixture(b.dataset.src!, b.dataset.label!);
   });
 }
-await loadFixture("/fixtures/boxer.mp4", "boxer");
+// `?clip=<url>` plays any clip the browser can decode (e.g. a WebM on
+// Chromium builds without H.264) instead of the bundled boxer fixture.
+const clipParam = new URLSearchParams(location.search).get("clip");
+if (clipParam) for (const b of picker.querySelectorAll("button")) b.classList.remove("active");
+await loadFixture(clipParam ?? "/fixtures/boxer.mp4", clipParam ? "custom clip" : "boxer");
 
 // ── Loop ────────────────────────────────────────────────────────────────
 const LM_S = 0.5;
-// HAND_S is lower than the body LM_S because hold-last (line ~130) means a
-// single noisy detection persists across dropout frames; aggressive smoothing
-// (low alpha) damps the visible effect of any one outlier detection. The
-// trade-off is finger motion lags real motion by ~3 frames, which is fine
-// for video where finger micro-movements aren't the focus.
-const HAND_S = 0.35;
 const SMOOTH = 0.25;
 
 // ── Hand tracking toggle ────────────────────────────────────────────────────
-// Finger articulation from MediaPipe hand landmarks is unreliable on
-// full-body footage (the hand is a few % of frame, so per-finger landmarks —
-// especially the distal joints — are dominated by noise). The whole hand
-// pipeline (ROI detection, frame alignment, palmar-clamped coordinated curl)
-// is kept intact below and in `src/mediapipe/landmarks.ts`, but disabled here:
-// with no hand landmarks fed to the driver, the hand bones inherit their
-// natural rest pose (a relaxed, open hand) and the wrist follows the forearm.
-// Flip to `true` to re-enable live finger tracking.
-const TRACK_HANDS = false;
+// Per-wrist ROI crops → MediaPipe Hand → `handsForDriver` (anatomical side,
+// image landmarks lifted to 3D, chirality fixed) → palm + finger bones. On
+// a far-away subject the finger detail is a best guess, but the anatomical
+// joint model keeps it a plausible hand. Toggle with the ✋ button.
+let trackHands = true;
+const handsBtn = document.getElementById("hands") as HTMLButtonElement | null;
+handsBtn?.addEventListener("click", () => {
+  trackHands = !trackHands;
+  handsBtn.classList.toggle("active", trackHands);
+  if (!trackHands) { lastHandDet = null; tracker.reset(); }
+});
 
 let sScale = 280;
 let sCx = W / 2;
@@ -144,8 +148,11 @@ function tick(): void {
   if (now - lastFrame < 16) return;
   lastFrame = now;
 
-  if (video.readyState >= 2 && now !== lastTs) {
-    lastTs = now;
+  // One tracker update per NEW video frame: feeding it the same reading
+  // twice would make it overconfident.
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    if (video.currentTime < lastVideoTime) tracker.reset();   // looped or seeked
+    lastVideoTime = video.currentTime;
     const poseRes = poseLandmarker.detectForVideo(video, now);
 
     if (poseRes.landmarks.length > 0) {
@@ -153,104 +160,24 @@ function tick(): void {
       smoothImageLm = smoothLandmarks(smoothImageLm, lastImageLm, LM_S);
       smoothWorldLm = smoothLandmarks(smoothWorldLm, poseRes.worldLandmarks[0], LM_S);
 
-      // Hands: run the ROI detector every other frame (saves ~10ms/frame,
-      // smoothing covers the gap). On far-away subjects this is the only way
-      // to get hand landmarks — the full-frame HandLandmarker returns 0 hands
-      // because the hands are < 5% of the frame. Skipped when TRACK_HANDS is
-      // off, EXCEPT during fixture capture (where we still need raw hand
-      // landmarks recorded to JSON for the hand tests).
-      const capturing = Array.isArray((window as unknown as { __captureFrames?: unknown }).__captureFrames);
-      if ((TRACK_HANDS || capturing) && (handFrame++ & 1) === 0) {
-        lastHandRes = handRoi.detect(video, smoothImageLm);
-        // Expose for devtools/Playwright inspection.
-        (window as unknown as { __handRoi?: unknown }).__handRoi = handRoi.lastDebug;
+      // Hands: run the ROI detector every other frame (saves ~10 ms/frame;
+      // the tracker carries the hands through the gap). Full-frame detection
+      // fails on far-away subjects (hands < 5 % of the frame), hence the
+      // per-wrist crops.
+      let hands: DriverHands = {};
+      if (trackHands && (handFrame++ & 1) === 0) {
+        lastHandDet = handRoi.detect(video, smoothImageLm);
+        hands = handsForDriver(lastHandDet, video.videoWidth, video.videoHeight, smoothImageLm);
+        handsSeen = (hands.leftHand ? "L" : "-") + (hands.rightHand ? "R" : "-");
       }
-
-      // Expose model + bone buffers so the in-page hand verifier can compute
-      // each finger bone's Y axis in world and compare it to the MP-derived
-      // target direction. Set once; the buffers are mutated in place by FK.
-      const wd = window as unknown as {
-        __model?: unknown; __boneIndex?: unknown; __boneXforms?: unknown;
-        __smoothLeftHand?: unknown; __smoothRightHand?: unknown;
-      };
-      if (!wd.__model) {
-        wd.__model = model;
-        wd.__boneIndex = boneIndex;
-        wd.__boneXforms = boneXforms;
-      }
-      // The smoothed hands ARE what the driver consumes (lastHandRes is the
-      // raw ROI result — smoothing + outlier reject sit between). Expose the
-      // smoothed arrays each frame so the verifier compares like-for-like.
-      wd.__smoothLeftHand  = smoothLeftHand;
-      wd.__smoothRightHand = smoothRightHand;
-
-      // The ROI detector returns side-keyed results directly — each crop is
-      // centred on a specific pose wrist, so the detected hand IS the
-      // anatomically-correct one. No re-disambiguation needed.
-      const lH = lastHandRes?.leftHand?.world;
-      const rH = lastHandRes?.rightHand?.world;
-
-      // Debug hook: image-space hand wrists + both pose wrists, plus a few
-      // world landmarks so we can verify hand chirality numerically.
-      // For a LEFT hand: thumb sits on the medial (subject's right) side, so
-      // in MP world (+x = anatomical-left) we expect thumb_CMC.x < wrist.x.
-      // For a RIGHT hand: thumb on subject's left = +x → thumb_CMC.x > wrist.x.
-      // If empirics disagree, MP's hand model is outputting chirality-flipped
-      // landmarks (a known consequence of its "input is mirrored" training).
-      (window as unknown as { __handAssign?: unknown }).__handAssign = {
-        poseLeft:  smoothImageLm[15],
-        poseRight: smoothImageLm[16],
-        leftHandWrist:  lastHandRes?.leftHand?.image[0]  ?? null,
-        rightHandWrist: lastHandRes?.rightHand?.image[0] ?? null,
-        leftHandWorld:  lastHandRes?.leftHand?.world
-          ? {
-              wrist:    lastHandRes.leftHand.world[0],
-              thumbCmc: lastHandRes.leftHand.world[1],
-              indexMcp: lastHandRes.leftHand.world[5],
-              pinkyMcp: lastHandRes.leftHand.world[17],
-            }
-          : null,
-        rightHandWorld: lastHandRes?.rightHand?.world
-          ? {
-              wrist:    lastHandRes.rightHand.world[0],
-              thumbCmc: lastHandRes.rightHand.world[1],
-              indexMcp: lastHandRes.rightHand.world[5],
-              pinkyMcp: lastHandRes.rightHand.world[17],
-            }
-          : null,
-      };
-      // Update only when fresh landmarks arrive AND they don't look like a
-      // noise spike. Two safeguards in series:
-      //   1) hold-last: skip the smoothLandmarks call when the ROI failed
-      //      this frame, otherwise fingers would snap to rest on every miss.
-      //   2) outlier reject: if the fresh detection differs from the held
-      //      pose by > 60° on any wrist→knuckle direction (likely a noise
-      //      spike rather than real motion), skip THAT update too.
-      // Without (2), hold-last would "lock in" the first noisy detection and
-      // keep it visible until the next clean detection lands — the cause of
-      // the visible finger-jumping the user reported.
-      if (lH && !isHandOutlier(smoothLeftHand,  lH)) {
-        smoothLeftHand  = smoothLandmarks(smoothLeftHand,  lH, HAND_S);
-      }
-      if (rH && !isHandOutlier(smoothRightHand, rH)) {
-        smoothRightHand = smoothLandmarks(smoothRightHand, rH, HAND_S);
-      }
-
-      // Capture hook: the parity-fixture script (tools/capture_landmarks.ts)
-      // attaches `window.__captureFrames = []` and reads it back after playback.
-      // We push everything the verifier needs: pose world + pose image + per-hand
-      // (world + image) keyed by the anatomical side the ROI detector assigned.
-      const w = window as unknown as { __captureFrames?: object[] };
-      if (Array.isArray(w.__captureFrames)) {
-        const handPayload = (h?: { image: Landmark[]; world: WorldLandmark[] }) =>
-          h ? { world: h.world.map(lm => ({ ...lm })), image: h.image.map(lm => ({ ...lm })) } : undefined;
-        w.__captureFrames.push({
-          worldLandmarks: poseRes.worldLandmarks[0].map(lm => ({ ...lm })),
-          imageLandmarks: poseRes.landmarks[0].map(lm => ({ ...lm })),
-          leftHand:  handPayload(lastHandRes?.leftHand),
-          rightHand: handPayload(lastHandRes?.rightHand),
-        });
-      }
+      const t1 = performance.now();
+      lastDeltas = tracker.update({
+        pose: smoothWorldLm,
+        ...hands,
+        // Lower threshold so half-occluded limbs still drive — noisy beats stuck-at-rest.
+        visibilityMin: 0.2,
+      }, video.currentTime * 1000);
+      poseMs = (performance.now() - t1).toFixed(1);
     }
   }
 
@@ -262,63 +189,15 @@ function tick(): void {
   ctx.fillStyle = "#0a0a0f";
   ctx.fillRect(0, 0, W, H);
 
-  if (!smoothWorldLm || !smoothImageLm || !lastImageLm) {
+  if (!smoothWorldLm || !smoothImageLm || !lastImageLm || !lastDeltas) {
     ctx.fillStyle = "#555";
     ctx.font = "18px monospace";
     ctx.fillText("Waiting for first pose…", W/2 - 120, H/2);
     return;
   }
 
-  const t1 = performance.now();
-  const deltas = landmarksToPoseDeltas({
-    pose:      smoothWorldLm,
-    // Hands disabled (TRACK_HANDS) → undefined, so finger bones stay at their
-    // open rest pose and the wrist inherits the forearm.
-    leftHand:  TRACK_HANDS ? (smoothLeftHand  ?? undefined) : undefined,
-    rightHand: TRACK_HANDS ? (smoothRightHand ?? undefined) : undefined,
-    // Lower threshold so half-occluded limbs still drive — noisy beats stuck-at-rest.
-    visibilityMin: 0.2,
-    // Hold last good pose when MP visibility dips below threshold. Without
-    // this the arm snaps to spine on every confidence dip (boxer's guard
-    // hand sits at vis≈0.19 for ~15% of frames).
-    previousDeltas: lastDeltas ?? undefined,
-  }, model, boneIndex);
-  lastDeltas = deltas;
-  forwardKinematics(model, deltas, boneXforms);
+  forwardKinematics(model, lastDeltas, boneXforms);
   const mesh = lbs(model, boneXforms, vertBuf, nrmBuf);
-  const poseMs = (performance.now() - t1).toFixed(1);
-
-  // Debug: also expose raw smoothed MP landmarks (image + world) so we can
-  // verify coordinate conventions (e.g. is MP world +x anatomical left?).
-  (window as unknown as { __lmDebug?: unknown }).__lmDebug = {
-    image: smoothImageLm,
-    world: smoothWorldLm,
-  };
-
-  // Debug: expose bone world positions so we can diagnose pose vs render
-  // bugs from devtools (e.g. compare hand vs head depth from a back view).
-  // boneXforms[b] = pose[b] @ inv(rest[b]); apply to rest-world bone origin
-  // to recover pose-world bone origin.
-  {
-    const dbg = window as unknown as { __bones?: Record<string, [number, number, number]> };
-    const t = (name: string): [number, number, number] | undefined => {
-      const i = boneIndex.get(name); if (i === undefined) return;
-      const m = i * 16, r = i * 16;
-      const rx = model.restBonePoses[r + 3];
-      const ry = model.restBonePoses[r + 7];
-      const rz = model.restBonePoses[r + 11];
-      return [
-        boneXforms[m]*rx + boneXforms[m+1]*ry + boneXforms[m+2]*rz + boneXforms[m+3],
-        boneXforms[m+4]*rx + boneXforms[m+5]*ry + boneXforms[m+6]*rz + boneXforms[m+7],
-        boneXforms[m+8]*rx + boneXforms[m+9]*ry + boneXforms[m+10]*rz + boneXforms[m+11],
-      ];
-    };
-    const bones: Record<string, [number, number, number]> = {};
-    for (const n of ["head", "neck01", "wrist.L", "wrist.R", "lowerarm01.L", "lowerarm01.R", "upperarm01.L", "upperarm01.R"]) {
-      const p = t(n); if (p) bones[n] = p;
-    }
-    dbg.__bones = bones;
-  }
 
   // Screen-space placement from image-space pose
   const lS = smoothImageLm[11], rS = smoothImageLm[12];
@@ -344,29 +223,18 @@ function tick(): void {
     const sv = buildSplitView(W, H, restMinZ);
     drawSplitView(gl, sv);
     drawSplitDivider(ctx, W, H);
-    drawSkeletonOverlay(
-      ctx, lastImageLm,
-      lastHandRes?.leftHand?.image ?? null,
-      lastHandRes?.rightHand?.image ?? null,
-      video, /* splitLayout */ true,
-    );
+    drawSkeletonOverlay(ctx, lastImageLm, lastHandDet, video, /* splitLayout */ true);
   } else {
     const q = computeQuadrants(W, H, sScale, restMinZ);
     const views = buildFourViews(q);
     drawFourViews(gl, views);
     drawDividers(ctx, W, H);
-    drawSkeletonOverlay(
-      ctx, lastImageLm,
-      lastHandRes?.leftHand?.image ?? null,
-      lastHandRes?.rightHand?.image ?? null,
-      video, /* splitLayout */ false,
-    );
+    drawSkeletonOverlay(ctx, lastImageLm, lastHandDet, video, /* splitLayout */ false);
   }
 
   ctx.fillStyle = "#4f4";
   ctx.font = "12px monospace";
-  const hands = (smoothLeftHand ? "L" : "-") + (smoothRightHand ? "R" : "-");
-  ctx.fillText(`FK+LBS ${poseMs} ms   ${fps} fps   hands:${hands}`, 10, H - 10);
+  ctx.fillText(`driver ${poseMs} ms   ${fps} fps   hands:${handsSeen}`, 10, H - 10);
 }
 
 /**
@@ -416,8 +284,7 @@ const HAND_EDGES: ReadonlyArray<[number, number]> = [
 function drawSkeletonOverlay(
   ctx: CanvasRenderingContext2D,
   lm: Landmark[],
-  leftHandImg: Landmark[] | null,
-  rightHandImg: Landmark[] | null,
+  hands: HandDetections | null,
   v: HTMLVideoElement,
   splitLayout: boolean,
 ): void {
@@ -465,8 +332,12 @@ function drawSkeletonOverlay(
   ctx.save();
   ctx.globalAlpha = 0.7;
   drawSkeleton(lm, POSE_EDGES, "#0f0", splitLayout ? 2 : 1.5, splitLayout ? 2 : 1.2);
-  if (leftHandImg)  drawSkeleton(leftHandImg,  HAND_EDGES, "#4af", splitLayout ? 1.5 : 1, splitLayout ? 1.6 : 1);
-  if (rightHandImg) drawSkeleton(rightHandImg, HAND_EDGES, "#f84", splitLayout ? 1.5 : 1, splitLayout ? 1.6 : 1);
+  for (const hand of hands?.landmarks ?? []) {
+    // Colour by which pose wrist the hand sits nearer: blue = left, orange = right.
+    const w = hand[MP_HAND.WRIST], pl = lm[15], pr = lm[16];
+    const left = Math.hypot(w.x - pl.x, w.y - pl.y) <= Math.hypot(w.x - pr.x, w.y - pr.y);
+    drawSkeleton(hand, HAND_EDGES, left ? "#4af" : "#f84", splitLayout ? 1.5 : 1, splitLayout ? 1.6 : 1);
+  }
   ctx.restore();
 }
 

@@ -28,26 +28,58 @@ tasks:
     cmds: [bunx tsc --noEmit -p tsconfig.check.json]
 
   test:
-    desc: Run all tests (unit + parity)
+    desc: Run unit + parity tests (fast, no browser)
     cmds: [bun test]
+
+  assets:
+    desc: Download MediaPipe models + MediaPipe's test photos into .cache/ (idempotent)
+    cmds: [bun tools/fetch_assets.ts]
+
+  test:browser:
+    desc: "Headless Chromium regression gates: real MediaPipe on synthetic hands, photos, demo clips (~1 min)"
+    deps: [assets]
+    env:
+      ANNY_BROWSER: "1"
+    cmds: [bun test tests/browser]
+
+  validate:
+    desc: "Round trip (image → MediaPipe → Anny → render → MediaPipe) + synthetic ground truth; HTML reports in .cache/"
+    deps: [assets]
+    cmds:
+      - bun tools/synthetic.ts --random 60
+      - bun tools/roundtrip.ts --set all --frames 12
+
+  naturalness:
+    desc: "How natural driven hands are: validate the metrics on labelled poses, then score the demo clips (needs `task sequences` once)"
+    cmds:
+      - bun tools/naturalness.ts validate
+      - bun tools/naturalness.ts sequences
+
+  sequences:
+    desc: Cache MediaPipe's detections on every frame of the demo clips → .cache/sequences/ (~3 min)
+    deps: [assets]
+    cmds: [bun tools/capture_sequences.ts]
+
+  hand-model:
+    desc: "Refit the natural-hand prior + MediaPipe noise model: render ground-truth hands at several sizes, measure real-footage noise, emit src/mediapipe/hand-prior.ts (~10 min)"
+    deps: [assets]
+    cmds:
+      - bun tools/hand_dataset.ts
+      - bun tools/hand_tta.ts
+      - bun tools/hand_trust.ts --emit
 
   clean:
     desc: Remove build output
     cmds: [rm -rf dist/ dist-demo/]
 
   demo:
-    desc: Serve demos via Vite dev server at http://localhost:3000 (HMR enabled)
+    desc: Serve demos via Vite dev server at http://localhost:3000 (HMR enabled; add ?mp=local to load MediaPipe from node_modules + .cache)
     cmds: [bunx vite]
 
   fixtures:
     desc: "Regenerate Python-anny parity fixtures (needs body-tuning venv active)"
     cmds:
       - python tools/gen_parity_fixtures.py
-
-  fixtures:landmarks:
-    desc: "Capture MediaPipe landmark fixtures from demo videos (needs `task demo` running)"
-    cmds:
-      - bun tools/capture_landmarks.ts
 
   # ── Versioning (package.json as single source of truth) ────────────────────
 
@@ -108,37 +140,42 @@ tasks:
       - rm -rf dist/
       - bunx tsc
 
-  _publish:
+  _on-main:
     internal: true
     cmds:
-      - npm publish --access public
+      - |
+        branch=$(git rev-parse --abbrev-ref HEAD)
+        [ "$branch" = "main" ] || { echo "Error: release from main (on '$branch')." >&2; exit 1; }
+        git fetch -q origin main
+        [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] \
+          || { echo "Error: main is not in sync with origin/main — pull/push first." >&2; exit 1; }
 
   # ── Ship (the one command to rule them all) ─────────────────────────────────
 
   ship:
-    desc: "check-clean → bump → build → npm publish → git push. BUMP=patch|minor|major (default: patch)"
+    desc: "main only: check-clean → bump + tag → check/test/build → push. CI then publishes to npm (trusted publishing) and creates the GitHub release. BUMP=patch|minor|major (default: patch)"
     vars:
       BUMP: '{{default "patch" .BUMP}}'
     cmds:
+      - task: _on-main
       - task: _check-clean
       - task: bump
         vars: {BUMP: "{{.BUMP}}"}
       - task: _build
-      - task: _publish
       - |
           version=$(node -p "require('./package.json').version")
           tag="{{.PKG_NAME}}/v${version}"
           git push origin HEAD "$tag"
           echo ""
-          echo "Shipped {{.PKG_NAME}}@${version} — available on:"
+          echo "Tagged {{.PKG_NAME}}@${version} — CI (release job) publishes it:"
+          echo "  run:        https://github.com/datar-psa/anny-js/actions"
           echo "  npm:        https://www.npmjs.com/package/{{.PKG_NAME}}"
           echo "  jsDelivr:   https://cdn.jsdelivr.net/npm/{{.PKG_NAME}}@${version}/dist/index.js"
-          echo "  unpkg:      https://unpkg.com/{{.PKG_NAME}}@${version}/dist/index.js"
 
   # ── Firebase Hosting (demo pages) ──────────────────────────────────────────
 
   deploy:
-    desc: "Deploy to anny-js.clad.you (Firebase Hosting under clad-main)"
+    desc: "Manual (break-glass) deploy to anny-js.clad.you. Normally CI deploys main; every branch gets a preview."
     deps: [build, "build:demo"]
     cmds:
       - bunx firebase deploy --only hosting:{{.PKG_NAME}} --project {{.FIREBASE_PROJECT}}

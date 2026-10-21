@@ -18,14 +18,47 @@ export interface WorldLandmark {
   visibility?: number;
 }
 
+/**
+ * How much a hand reading can be trusted. `handsForDriver` fills it in.
+ *
+ * MediaPipe's finger angles and palm orientation degrade steeply as the hand
+ * shrinks in the image (measured: tools/hand_trust.ts) — on a full-body
+ * video frame a hand is often 10–30 px long, where its finger angles are
+ * worse than simply assuming a relaxed hand.
+ */
+export interface HandQuality {
+  /** Palm length (wrist → middle-finger knuckle) in image pixels. */
+  palmPx: number;
+  /**
+   * Whether MediaPipe's handedness label matches the side the hand was
+   * assigned to. A mismatch means its 3D reading was mirrored (and repaired
+   * by a depth flip), which leaves the palm orientation unreliable.
+   */
+  labelAgrees: boolean;
+}
+
 /** Input bundle for the driver. */
 export interface PoseInput {
-  /** 33 MediaPipe Pose worldLandmarks (metric, hip-centered). Required. */
-  pose: WorldLandmark[];
-  /** 21 MediaPipe Hand worldLandmarks for the left hand. Optional. */
+  /**
+   * 33 MediaPipe Pose worldLandmarks (metric, hip-centered). Drives trunk,
+   * head and limbs. Optional: hands alone still pose the hand in world.
+   */
+  pose?: WorldLandmark[];
+  /**
+   * 21 MediaPipe Hand worldLandmarks for the subject's anatomical LEFT hand.
+   * Route detections by anatomy (e.g. `assignHands`), not by position.
+   */
   leftHand?: WorldLandmark[];
-  /** 21 MediaPipe Hand worldLandmarks for the right hand. Optional. */
+  /** 21 MediaPipe Hand worldLandmarks for the anatomical RIGHT hand. */
   rightHand?: WorldLandmark[];
+  /**
+   * Reliability of each hand reading. When given, the reading is fused with
+   * a prior over natural hands and wrists — the smaller the hand in the
+   * image, the more the prior decides. Without it, readings are taken at
+   * face value (within anatomical limits). `handsForDriver` provides both.
+   */
+  leftHandQuality?: HandQuality;
+  rightHandQuality?: HandQuality;
   /**
    * Flip Anny X axis. Only set true if your upstream is already mirrored.
    * Standard MediaPipe output is subject-relative — leave false. Default: false.
@@ -34,9 +67,9 @@ export interface PoseInput {
   /** Minimum landmark visibility to drive a bone (default 0.5). */
   visibilityMin?: number;
   /**
-   * Maximum delta rotation angle per bone in radians, applied to `dir`
-   * targets only. Bounds the damage a single bad landmark can do.
-   * Default 2.5 rad (~143°).
+   * Maximum delta rotation angle per limb bone, radians. Bounds the damage a
+   * single bad landmark can do. Default π (no limit beyond the anatomical
+   * joint limits the driver always applies).
    */
   maxAngleRad?: number;
   /**

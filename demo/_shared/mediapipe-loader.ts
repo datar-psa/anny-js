@@ -3,14 +3,36 @@ import { PoseLandmarker, HandLandmarker, FilesetResolver }
 
 const VISION_VERSION = "0.10.14";
 const VISION_WASM = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VISION_VERSION}/wasm`;
+const MODELS = "https://storage.googleapis.com/mediapipe-models";
 const POSE_MODELS = {
-  lite:  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-  full:  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
-  heavy: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task",
+  lite:  `${MODELS}/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task`,
+  full:  `${MODELS}/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task`,
+  heavy: `${MODELS}/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task`,
 } as const;
-const HAND_MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+const HAND_MODEL = `${MODELS}/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`;
 
 export type PoseModelSize = keyof typeof POSE_MODELS;
+
+/** Where MediaPipe's runtime and model files come from. */
+export interface MediaPipeAssets {
+  /** Base URL of the tasks-vision `wasm/` directory. Default: jsDelivr. */
+  wasmBase?: string;
+  /**
+   * Base URL holding `pose_landmarker_{lite,full,heavy}.task` and
+   * `hand_landmarker.task` side by side. Default: Google's model bucket.
+   */
+  modelBase?: string;
+}
+
+/**
+ * `?mp=local` → serve MediaPipe from the Vite dev server (node_modules wasm +
+ * `.cache/mediapipe` models from `task assets`) for offline / firewalled dev.
+ */
+export function mediaPipeAssetsFromQuery(): MediaPipeAssets {
+  return new URLSearchParams(location.search).get("mp") === "local"
+    ? { wasmBase: "/mp/wasm", modelBase: "/mp/models" }
+    : {};
+}
 
 export interface MediaPipeBundle {
   poseLandmarker: PoseLandmarker;
@@ -23,7 +45,7 @@ export interface MediaPipeBundle {
   handLandmarkerImage?: HandLandmarker;
 }
 
-export interface MediaPipeOptions {
+export interface MediaPipeOptions extends MediaPipeAssets {
   /** Pose model variant. `lite` for live webcam (default), `heavy` for offline video. */
   poseModel?: PoseModelSize;
   /**
@@ -43,8 +65,10 @@ export interface MediaPipeOptions {
  * Both run on GPU when available.
  */
 export async function createMediaPipe(opts: MediaPipeOptions = {}): Promise<MediaPipeBundle> {
-  const poseUrl = POSE_MODELS[opts.poseModel ?? "lite"];
-  const vision = await FilesetResolver.forVisionTasks(VISION_WASM);
+  const size = opts.poseModel ?? "lite";
+  const poseUrl = opts.modelBase ? `${opts.modelBase}/pose_landmarker_${size}.task` : POSE_MODELS[size];
+  const handUrl = opts.modelBase ? `${opts.modelBase}/hand_landmarker.task` : HAND_MODEL;
+  const vision = await FilesetResolver.forVisionTasks(opts.wasmBase ?? VISION_WASM);
   const tasks: Promise<unknown>[] = [
     PoseLandmarker.createFromOptions(vision, {
       baseOptions: { modelAssetPath: poseUrl, delegate: "GPU" },
@@ -52,7 +76,7 @@ export async function createMediaPipe(opts: MediaPipeOptions = {}): Promise<Medi
       numPoses: 1,
     }),
     HandLandmarker.createFromOptions(vision, {
-      baseOptions: { modelAssetPath: HAND_MODEL, delegate: "GPU" },
+      baseOptions: { modelAssetPath: handUrl, delegate: "GPU" },
       runningMode: "VIDEO",
       numHands: 2,
     }),
@@ -68,7 +92,7 @@ export async function createMediaPipe(opts: MediaPipeOptions = {}): Promise<Medi
   // detector firing on real hands while rejecting the worst outliers.
   if (opts.handMode === "image") {
     tasks.push(HandLandmarker.createFromOptions(vision, {
-      baseOptions: { modelAssetPath: HAND_MODEL, delegate: "GPU" },
+      baseOptions: { modelAssetPath: handUrl, delegate: "GPU" },
       runningMode: "IMAGE",
       numHands: 1,                 // one hand per ROI crop
       minHandDetectionConfidence: 0.4,

@@ -363,7 +363,7 @@ can't see is left to the prior.
 **Physiology the prior can't express**, enforced on top:
 
 - passive ranges: forearm roll ±90° (the rig's rest is mid-prone), wrist
-  −80…80° / −35…22°; roll beyond the forearm goes to the humerus when the
+  −85…85° / −40…25°; roll beyond the forearm goes to the humerus when the
   elbow is straight (the pose can't see humeral rotation then);
 - DIP–PIP tendon coupling as a soft constraint (SD 10°) — MediaPipe's fist
   error is a *bias* (fingertips hidden in the fist, read as a hook) that a

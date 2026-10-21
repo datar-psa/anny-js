@@ -151,7 +151,7 @@ tasks:
   # ── Firebase Hosting (demo pages) ──────────────────────────────────────────
 
   deploy:
-    desc: "Deploy to anny-js.clad.you (Firebase Hosting under clad-main)"
+    desc: "Manual deploy to anny-js.clad.you (Firebase Hosting under clad-main). CI deploys main automatically."
     deps: [build, "build:demo"]
     cmds:
       - bunx firebase deploy --only hosting:{{.PKG_NAME}} --project {{.FIREBASE_PROJECT}}

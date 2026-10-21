@@ -9,7 +9,7 @@ Two pillars:
 
 End-to-end (MediaPipe pose → posed mesh) is **< 6 ms** on integrated GPU. The library itself is a 1.4 MB binary asset + ~15 KB of TypeScript.
 
-**[▶ Animation demo](https://clad.you/anny-js/demo/anim.html)**  ·  **[📷 Live pose demo](https://clad.you/anny-js/demo/live.html)**  ·  **[🎞 Pre-recorded video demo](https://clad.you/anny-js/demo/video.html)**
+**[▶ Animation demo](https://anny-js.clad.you/anim.html)**  ·  **[📷 Live pose demo](https://anny-js.clad.you/live.html)**  ·  **[🎞 Pre-recorded video demo](https://anny-js.clad.you/video.html)**
 
 ---
 
@@ -317,6 +317,34 @@ task assets          # MediaPipe models + MediaPipe's test photos → .cache/
 task test:browser    # regression gates (~1 min)
 task validate        # full reports
 ```
+
+---
+
+## Deploying the demo site
+
+GitHub Actions (`.github/workflows/ci.yml`) deploys the demo to
+[anny-js.clad.you](https://anny-js.clad.you) (Firebase Hosting site `anny-js`
+on `clad-main`) after the unit **and** headless MediaPipe tests pass: every PR
+gets a 7-day preview channel with its URL commented on the PR, and every push
+to `main` goes live. Both deploy the exact build the tests ran against.
+
+One-time setup — a service account that can deploy Hosting and nothing else:
+
+```bash
+SA=anny-js-deploy@clad-main.iam.gserviceaccount.com
+gcloud iam service-accounts create anny-js-deploy --project clad-main \
+  --display-name "anny-js demo deploys (GitHub Actions)"
+for role in roles/firebasehosting.admin roles/serviceusage.apiKeysViewer; do
+  gcloud projects add-iam-policy-binding clad-main --member "serviceAccount:$SA" --role "$role" --condition None
+done
+gcloud iam service-accounts keys create key.json --iam-account "$SA"
+gh secret set FIREBASE_SERVICE_ACCOUNT_CLAD_MAIN --repo datar-psa/anny-js < key.json && rm key.json
+```
+
+Deliberately not granted: `roles/firebaseauth.admin`, which the deploy action's
+docs suggest only so preview URLs get added to Firebase Auth's authorized
+domains — the demo has no login, and on `clad-main` it would hand CI the
+PWA's users. `task deploy` still deploys from a logged-in machine.
 
 ---
 

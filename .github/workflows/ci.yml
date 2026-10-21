@@ -1,0 +1,127 @@
+# CI + demo deploys for anny-js.
+#
+#   check    typecheck, unit + parity tests, library and demo builds
+#   browser  real MediaPipe in headless Chromium: synthetic hands, labelled
+#            photos and demo clips through the round trip (tests/browser)
+#   preview  PRs: deploy the tested demo build to a Firebase Hosting preview
+#            channel and comment the URL on the PR
+#   deploy   pushes to main: deploy the tested demo build to anny-js.clad.you
+#
+# Needs one repository secret, FIREBASE_SERVICE_ACCOUNT_CLAD_MAIN: a JSON key
+# for a service account on clad-main with roles/firebasehosting.admin and
+# roles/serviceusage.apiKeysViewer. Nothing else — in particular NOT
+# roles/firebaseauth.admin (the action's docs suggest it only to add preview
+# URLs to Firebase Auth's authorized domains; this demo has no login, and on
+# clad-main it would let CI manage the PWA's users).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  BUN_VERSION: 1.4.2
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - name: Typecheck (src, demo, tests, tools)
+        run: bunx tsc --noEmit -p tsconfig.check.json
+      - name: Unit + parity + IK recovery tests
+        run: bun test
+      - name: Build library
+        run: bunx tsc
+      - name: Build demo site
+        run: bunx vite build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-demo
+          path: dist-demo
+          retention-days: 7
+
+  browser:
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - name: Install Chromium + ffmpeg
+        run: |
+          bunx playwright install --with-deps chromium
+          command -v ffmpeg || { sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg; }
+      - name: Cache MediaPipe models + test photos
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/mediapipe
+            .cache/testdata
+          key: mediapipe-assets-${{ hashFiles('tools/fetch_assets.ts') }}
+      - name: Fetch assets
+        run: bun tools/fetch_assets.ts
+      - name: Headless MediaPipe regression gates
+        run: bun test tests/browser
+        env:
+          ANNY_BROWSER: "1"
+
+  preview:
+    # Fork PRs get no secrets, so they can't deploy previews.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [check, browser]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-demo
+          path: dist-demo
+      - uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_CLAD_MAIN }}
+          projectId: clad-main
+          expires: 7d
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [check, browser]
+    runs-on: ubuntu-24.04
+    environment:
+      name: anny-js-demo
+      url: https://anny-js.clad.you
+    concurrency:
+      group: deploy-anny-js-demo
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-demo
+          path: dist-demo
+      - uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_CLAD_MAIN }}
+          projectId: clad-main
+          channelId: live

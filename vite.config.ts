@@ -1,9 +1,25 @@
 import { defineConfig, type Plugin } from "vite";
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { cpSync, createReadStream, existsSync, statSync } from "node:fs";
 import { resolve, sep } from "node:path";
 
 const root = resolve(__dirname, "demo");
 const projectRoot = __dirname;
+
+/**
+ * Ship the demo clips. The video demo references them by runtime URL
+ * (`/fixtures/*.mp4`), which Vite can't see, and they don't belong in
+ * `assets/` (the npm package's `files`).
+ */
+function copyDemoFixtures(): Plugin {
+  return {
+    name: "copy-demo-fixtures",
+    apply: "build",
+    writeBundle(options) {
+      const outDir = options.dir ?? resolve(projectRoot, "dist-demo");
+      cpSync(resolve(root, "fixtures"), resolve(outDir, "fixtures"), { recursive: true });
+    },
+  };
+}
 
 /**
  * Dev-only: serve MediaPipe locally for `?mp=local` (offline / firewalled
@@ -41,7 +57,7 @@ export default defineConfig({
   root,
   // Serve assets/ at site root so demos can fetch /anny_model.json directly.
   publicDir: resolve(projectRoot, "assets"),
-  plugins: [localMediaPipe()],
+  plugins: [localMediaPipe(), copyDemoFixtures()],
   server: {
     port: 3000,
     fs: {

@@ -23,7 +23,9 @@ import { loadFixtureModel } from "../_helpers/model.js";
 import { PHOTOS, photoPath, videoFrames } from "../roundtrip/cases.js";
 import { HarnessClient } from "../roundtrip/client.js";
 import { mean, percentile } from "../roundtrip/metrics.js";
-import { makeContext, runImageCase, type CaseResult, type RunContext } from "../roundtrip/run.js";
+import { driverInput, makeContext, runImageCase, type CaseResult, type Driver, type RunContext } from "../roundtrip/run.js";
+import { buildPhysicalRig } from "../naturalness/physical.js";
+import { NaturalnessScorer } from "../naturalness/score.js";
 import { summarize } from "../roundtrip/report.js";
 import { handPoseSpecs, runSyntheticHand, type SyntheticHandResult } from "../roundtrip/synthetic.js";
 import { chromiumAvailable } from "./browser.js";
@@ -48,7 +50,7 @@ describe.skipIf(!ENABLED)("headless MediaPipe round trip", () => {
     await client?.close();
   });
 
-  test("synthetic hands: MediaPipe reads our renders, the driver adds no error", async () => {
+  test("synthetic hands: the driver is closer to the truth than MediaPipe's reading", async () => {
     const results: SyntheticHandResult[] = [];
     for (const spec of handPoseSpecs(30, 7)) results.push(await runSyntheticHand(ctx, spec, landmarksToPoseDeltas));
     const ok = results.filter(r => r.mpVsGt && r.drivenVsGt);
@@ -56,34 +58,59 @@ describe.skipIf(!ENABLED)("headless MediaPipe round trip", () => {
 
     expect(ok.length / results.length).toBeGreaterThan(0.75);
     // Absolute accuracy of the whole pipeline against the known pose.
-    expect(m(r => r.drivenVsGt!.fingerFlex)).toBeLessThan(26);
+    expect(m(r => r.drivenVsGt!.fingerFlex)).toBeLessThan(18);
     expect(m(r => r.drivenVsGt!.palmNormal)).toBeLessThan(22);
     expect(m(r => r.drivenVsGt2D!)).toBeLessThan(0.2);
-    // The driver must not be worse than its input: its anatomical model may
-    // only remove MediaPipe noise, never add to it.
-    expect(m(r => r.drivenVsGt!.fingerFlex)).toBeLessThan(m(r => r.mpVsGt!.fingerFlex) + 1);
+    // Fused with the natural-hand prior, the hand is closer to the truth
+    // than MediaPipe's own reading — and bends the wrong way far less often.
+    expect(m(r => r.drivenVsGt!.fingerFlex)).toBeLessThan(0.8 * m(r => r.mpVsGt!.fingerFlex));
     expect(m(r => r.drivenVsGt!.palmNormal)).toBeLessThan(m(r => r.mpVsGt!.palmNormal) + 1);
     const flips = (k: "mpVsGt" | "drivenVsGt") => ok.reduce((s, r) => s + r[k]!.bendSignFlips, 0);
-    expect(flips("drivenVsGt")).toBeLessThanOrEqual(flips("mpVsGt"));
+    expect(flips("drivenVsGt")).toBeLessThanOrEqual(0.25 * flips("mpVsGt"));
+  }, SLOW);
+
+  test("labelled hand photos: geometry reproduces MediaPipe's reading", async () => {
+    // Without hand quality the reading is taken at face value: the rig must
+    // do what MediaPipe saw, except where that leaves the joints' range of
+    // motion (fingers past their limits, a wrist on a forearm whose depth the
+    // pose got wrong).
+    const asRead: Driver = (input, m) => landmarksToPoseDeltas({ ...input, leftHandQuality: undefined, rightHandQuality: undefined }, m);
+    const results: CaseResult[] = [];
+    for (const f of PHOTOS) results.push(await runImageCase(ctx, f, photoPath(f), asRead, { renderHands: false, renderBody: false }));
+    const s = summarize(results);
+    expect(s.hands.palmNormal.srcVsModel).toBeLessThan(1);
+    expect(s.hands.fingerFlex.srcVsModel).toBeLessThan(6);
+    expect(s.hands.thumbFlex.srcVsModel).toBeLessThan(7);
+    // pose.jpg's left thumb is read inside the index finger; clearance moves it out.
+    expect(s.hands.bendSignFlips.srcVsModel).toBeLessThanOrEqual(1);
   }, SLOW);
 
   test("labelled hand photos: the render reads back like the photo", async () => {
     const results: CaseResult[] = [];
     for (const f of PHOTOS) results.push(await runImageCase(ctx, f, photoPath(f), landmarksToPoseDeltas));
     const s = summarize(results);
-
-    // Driver fidelity: the rig does what MediaPipe saw (fingers only differ
-    // where MediaPipe reports anatomically impossible flexion).
-    expect(s.hands.palmNormal.srcVsModel).toBeLessThan(1);
-    expect(s.hands.fingerFlex.srcVsModel).toBeLessThan(8);
-    expect(s.hands.thumbFlex.srcVsModel).toBeLessThan(5);
-    expect(s.hands.bendSignFlips.srcVsModel).toBe(0);
-    // Round trip, judged by MediaPipe on the render.
+    // With quality the reading is fused with the natural-hand prior, so the
+    // rig departs from it on purpose — most of all where MediaPipe reports
+    // anatomically impossible fingers (fist.jpg: a 147° PIP with the
+    // fingertip hyperextended −31°). The round trip bounds how far…
     expect(s.hands.rtDetected / s.hands.n).toBeGreaterThan(0.85);
-    expect(s.hands.shape2D.srcVsRt).toBeLessThan(0.13);
-    expect(s.hands.fingerFlex.srcVsRt).toBeLessThan(18);
-    expect(s.hands.bendSignFlips.srcVsRt).toBeLessThanOrEqual(2);
+    expect(s.hands.shape2D.srcVsRt).toBeLessThan(0.16);
+    expect(s.hands.fingerFlex.srcVsRt).toBeLessThan(20);
+    expect(s.hands.bendSignFlips.srcVsRt).toBeLessThanOrEqual(3);
     expect(s.body.srcVsRt).toBeLessThan(9);
+    // …and every driven hand is one a person could make.
+    const scorer = new NaturalnessScorer(model, ctx.extras, buildPhysicalRig(model));
+    for (const r of results) {
+      const input = driverInput(r.detection, ctx.handSource);
+      if (!input) continue;
+      const deltas = landmarksToPoseDeltas(input, model);
+      for (const h of r.hands) {
+        const n = scorer.score(deltas, h.side);
+        expect(n.anatomy.total, `${r.name} ${h.side}`).toBeLessThan(5);
+        expect(n.physical.penetrationMm, `${r.name} ${h.side}`).toBeLessThan(3);
+        expect(n.physical.armRom, `${r.name} ${h.side}`).toBeLessThan(1);
+      }
+    }
   }, SLOW);
 
   test("demo clips: full-body round trip", async () => {

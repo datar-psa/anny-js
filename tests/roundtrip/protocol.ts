@@ -53,6 +53,20 @@ export interface RenderOptions {
 export interface DetectOptions {
   /** Run the pose landmarker (default true); false for hand close-ups. */
   pose?: boolean;
+  /**
+   * Bilinearly upscale the image to this width before detection — mimics the
+   * demo's ROI path, which feeds MediaPipe a 256 px crop of a few-pixel hand.
+   * Landmarks stay normalised to the original image.
+   */
+  upscaleTo?: number;
+  /**
+   * Test-time augmentation: shift (fractions of width/height), scale and
+   * rotate the image about its centre before detection. Joint angles are
+   * invariant to all three, so the spread of readings across augmentations
+   * measures MediaPipe's instability on an image — no ground truth needed.
+   * Landmarks are NOT mapped back (they refer to the augmented image).
+   */
+  augment?: { dx: number; dy: number; scale: number; rotDeg: number };
 }
 
 export type PoseModel = "lite" | "full" | "heavy";

@@ -56,7 +56,8 @@ export function randomPose(model: AnnyModel, boneIndex: Map<string, number>, see
     set(`upperarm01.${s}`, rot(axis(), u(10, 100)));
     set(`lowerarm01.${s}`, mul(rot([1, 0, 0], u(0, 110)), rot([0, 1, 0], u(-40, 40))));
     set(`lowerarm02.${s}`, rot([0, 1, 0], u(-40, 40)));
-    set(`wrist.${s}`, mul(rot([1, 0, 0], u(-45, 45)), rot([0, 0, 1], u(-15, 15))));
+    // Wrist: local Z flexes (mirrored between hands), local X deviates radially.
+    set(`wrist.${s}`, mul(rot([0, 0, 1], u(-45, 45)), rot([1, 0, 0], u(-25, 12))));
     set(`upperleg01.${s}`, rot(axis(), u(0, 45)));
     set(`lowerleg01.${s}`, rot([1, 0, 0], u(0, 90)));
     set(`foot.${s}`, rot([1, 0, 0], u(-20, 20)));

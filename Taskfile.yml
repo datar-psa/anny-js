@@ -49,6 +49,25 @@ tasks:
       - bun tools/synthetic.ts --random 60
       - bun tools/roundtrip.ts --set all --frames 12
 
+  naturalness:
+    desc: "How natural driven hands are: validate the metrics on labelled poses, then score the demo clips (needs `task sequences` once)"
+    cmds:
+      - bun tools/naturalness.ts validate
+      - bun tools/naturalness.ts sequences
+
+  sequences:
+    desc: Cache MediaPipe's detections on every frame of the demo clips → .cache/sequences/ (~3 min)
+    deps: [assets]
+    cmds: [bun tools/capture_sequences.ts]
+
+  hand-model:
+    desc: "Refit the natural-hand prior + MediaPipe noise model: render ground-truth hands at several sizes, measure real-footage noise, emit src/mediapipe/hand-prior.ts (~10 min)"
+    deps: [assets]
+    cmds:
+      - bun tools/hand_dataset.ts
+      - bun tools/hand_tta.ts
+      - bun tools/hand_trust.ts --emit
+
   clean:
     desc: Remove build output
     cmds: [rm -rf dist/ dist-demo/]

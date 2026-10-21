@@ -21,16 +21,22 @@ import { randomPose } from "../roundtrip/random-pose.js";
 import { buildRigExtras, handJointsAnny, poseJointsAnny, toMpWorld, type PosedSkeleton, type RigExtras } from "../roundtrip/skeleton.js";
 import { landmarksOf, posedSkeleton } from "../roundtrip/synthetic-landmarks.js";
 import { angleDeg } from "../roundtrip/vec.js";
+import { buildPhysicalRig, physicalScore, type PhysicalRig } from "../naturalness/physical.js";
 
 let model: AnnyModel;
 let boneIndex: Map<string, number>;
 let extras: RigExtras;
+let physical: PhysicalRig;
 
 beforeAll(async () => {
   model = await loadFixtureModel();
   boneIndex = buildBoneIndex(model);
   extras = buildRigExtras(model);
+  physical = buildPhysicalRig(model);
 });
+
+/** Ground-truth hands whose thumb is buried in a finger can't be reproduced — the driver keeps thumbs out. */
+const PENETRATING_MM = 1;
 
 const SEEDS = Array.from({ length: 60 }, (_, i) => i + 1);
 
@@ -61,13 +67,15 @@ describe("driver recovers known poses from ideal landmarks", () => {
   test("hands: palm orientation, every finger joint, thumb", () => {
     const fingers: number[] = [], thumbs: number[] = [], palms: number[] = [], flips: number[] = [];
     for (const seed of SEEDS) {
-      const gt = posedSkeleton(model, extras, randomPose(model, boneIndex, seed));
+      const gtDeltas = randomPose(model, boneIndex, seed);
+      const gt = posedSkeleton(model, extras, gtDeltas);
       const lm = landmarksOf(gt);
       const got = posedSkeleton(model, extras, landmarksToPoseDeltas(lm, model));
       for (const s of ["L", "R"] as const) {
         const d = compareHands(hand(gt, s), hand(got, s));
         fingers.push(d.fingerFlex);
-        thumbs.push(d.thumbFlex);
+        // Thumbs touching a finger are moved clear (see below); clear ones must come back exactly.
+        if (physicalScore(physical, gtDeltas, s).thumbPenetrationMm === 0) thumbs.push(d.thumbFlex);
         palms.push(d.palmNormal);
         flips.push(d.bendSignFlips);
       }
@@ -77,6 +85,22 @@ describe("driver recovers known poses from ideal landmarks", () => {
     expect(mean(fingers)).toBeLessThan(2);
     expect(Math.max(...fingers)).toBeLessThan(4);
     expect(Math.max(...flips)).toBe(0);
+  });
+
+  test("thumbs are kept out of the fingers", () => {
+    let buried = 0;
+    for (const seed of SEEDS) {
+      const gtDeltas = randomPose(model, boneIndex, seed);
+      const driven = landmarksToPoseDeltas(landmarksOf(posedSkeleton(model, extras, gtDeltas)), model);
+      for (const s of ["L", "R"] as const) {
+        const before = physicalScore(physical, gtDeltas, s).thumbPenetrationMm;
+        if (before < PENETRATING_MM) continue;
+        buried++;
+        // Judged by the naturalness metric's own (fuller) capsule model, not the driver's.
+        expect(physicalScore(physical, driven, s).thumbPenetrationMm).toBeLessThan(Math.min(1, before / 3));
+      }
+    }
+    expect(buried).toBeGreaterThan(5);   // the generator does produce buried thumbs to test against
   });
 
   test("hands without a pose: hand still oriented and articulated in world", () => {

@@ -21,7 +21,7 @@ const toWire = (d: PoseDeltas): WireDeltas => d.map(m => (m ? Array.from(m) : nu
 interface HarnessWindow {
   harness: {
     init(o: HarnessInit): Promise<{ loadMs: number }>;
-    detectUrl(url: string): Promise<Detection>;
+    detectUrl(url: string, det?: DetectOptions): Promise<Detection>;
     render(d: WireDeltas, c: CameraSpec, o?: RenderOptions): string;
     renderAndDetect(d: WireDeltas, c: CameraSpec, o?: RenderOptions, det?: DetectOptions): { detection: Detection; png: string };
   };
@@ -54,11 +54,11 @@ export class HarnessClient {
   }
 
   /** Run MediaPipe on an image file under `.cache/`. */
-  async detectFile(path: string): Promise<Detection> {
+  async detectFile(path: string, det: DetectOptions = {}): Promise<Detection> {
     const rel = relative(CACHE_DIR, resolve(path));
     if (rel.startsWith("..")) throw new Error(`${path} must live under ${CACHE_DIR}`);
     const url = "/cache/" + rel.split("\\").join("/");
-    return this.page.evaluate(u => (window as unknown as HarnessWindow).harness.detectUrl(u), url);
+    return this.page.evaluate(([u, d]) => (window as unknown as HarnessWindow).harness.detectUrl(u, d), [url, det] as const);
   }
 
   async render(deltas: PoseDeltas, cam: CameraSpec, opts: RenderOptions = {}): Promise<string> {

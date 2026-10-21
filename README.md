@@ -106,19 +106,20 @@ import {
   loadAnnyModel,
   allocBoneTransforms, lbs, allocVertexBuffer, forwardKinematics,
 } from 'anny-js/anny';
-import { landmarksToPoseDeltas, handsForDriver } from 'anny-js/mediapipe';
+import { handsForDriver, PoseTracker } from 'anny-js/mediapipe';
 
 const model     = await loadAnnyModel('/anny_model.json', '/anny_model.bin');
 const boneXf    = allocBoneTransforms(model.boneCount);
 const vertBuf   = allocVertexBuffer(model);
+const tracker   = new PoseTracker(model);
 
-// Per frame, with PoseLandmarker + HandLandmarker results on a W×H frame:
-function onFrame(poseRes, handRes, W, H) {
+// Once per NEW video frame, with PoseLandmarker + HandLandmarker results on a W×H frame:
+function onFrame(poseRes, handRes, W, H, timeMs) {
   const hands = handsForDriver(
     { landmarks: handRes.landmarks, handedness: handRes.handedness.map(h => h[0].categoryName) },
     W, H, poseRes.landmarks[0],          // pose image landmarks → anatomical L/R
   );
-  const deltas = landmarksToPoseDeltas({ pose: poseRes.worldLandmarks[0], ...hands }, model);
+  const deltas = tracker.update({ pose: poseRes.worldLandmarks[0], ...hands }, timeMs);
   forwardKinematics(model, deltas, boneXf);
   const { vertices, faces } = lbs(model, boneXf, vertBuf);
   // → feed into WebGL / Three.js / your renderer
@@ -127,11 +128,16 @@ function onFrame(poseRes, handRes, W, H) {
 
 `handsForDriver` assigns each detected hand to the subject's anatomical side,
 lifts MediaPipe's **image** landmarks to 3D (measurably more accurate than its
-`worldLandmarks`) and repairs MediaPipe's occasional left/right chirality slip.
-Hands are optional, and work without a pose too. See [`demo/live.html`](demo/live.html)
-for the full 4-view WebGL demo with recording, and
-[`docs/hand-tracking.md`](docs/hand-tracking.md) for what was measured and why
-the driver is built the way it is.
+`worldLandmarks`), repairs MediaPipe's occasional left/right chirality slip and
+attaches each hand's **quality** (its size in pixels, whether the handedness
+label agreed). The driver uses that to weigh the reading against a prior over
+natural hands: a 10 px hand in a full-body video is mostly prior, a close-up
+hand mostly reading. `PoseTracker` carries each hand from frame to frame as a
+Kalman filter whose model is that same prior; for single images use
+`landmarksToPoseDeltas` with the same input. Hands are optional, and work
+without a pose too. See [`demo/live.html`](demo/live.html) for the full 4-view
+WebGL demo with recording, and [`docs/hand-tracking.md`](docs/hand-tracking.md)
+for what was measured and why the driver is built the way it is.
 
 ---
 
@@ -211,18 +217,26 @@ setDeltas(deltas, model, [{ bone: 'spine01', rot }, ...])
 **From MediaPipe** (`anny-js/mediapipe`):
 
 ```ts
+// One image
 landmarksToPoseDeltas(
-  input: PoseInput,       // { pose?, leftHand?, rightHand?, mirrorX?, visibilityMin?, maxAngleRad?, previousDeltas? }
+  input: PoseInput,       // { pose?, leftHand?, rightHand?, leftHandQuality?, rightHandQuality?,
+                          //   mirrorX?, visibilityMin?, maxAngleRad?, previousDeltas? }
   model: AnnyModel,
 ): PoseDeltas
 
-// HandLandmarker result → { leftHand?, rightHand? } for PoseInput (recommended path)
+// Video: same input, once per new frame; hands filtered against the natural-hand prior
+new PoseTracker(model, { relax?: { shape, wrist }, forgetAfter? })
+  .update(input: PoseInput, timeMs: number): PoseDeltas
+  .reset()
+
+// HandLandmarker result → { leftHand?, rightHand?, leftHandQuality?, rightHandQuality? } (recommended path)
 handsForDriver(det: { landmarks, handedness: string[] }, width, height, poseImage?)
 
 // The pieces handsForDriver is built from:
 handSides(handsImage, labels, poseImage?, width?, height?): ("L" | "R")[]
 handLandmarks3D(imageLandmarks, width, height): WorldLandmark[]   // camera-axis 3D
 matchHandChirality(world, side, label): WorldLandmark[]           // fix a chirality slip
+palmLengthPx(imageLandmarks, width, height): number               // a hand's size → its HandQuality
 ```
 
 ---

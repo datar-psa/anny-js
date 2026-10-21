@@ -1,13 +1,12 @@
 /** Live webcam → MediaPipe → Anny demo. */
 
 import {
-  loadAnnyModel, buildBoneIndex, allocBoneTransforms,
+  loadAnnyModel, allocBoneTransforms,
   lbs, allocVertexBuffer, allocNormalBuffer, forwardKinematics,
 } from "../../src/anny/index.js";
 import type { PoseDeltas } from "../../src/anny/index.js";
-import { handsForDriver, landmarksToPoseDeltas } from "../../src/mediapipe/index.js";
-import type { Landmark, WorldLandmark } from "../../src/mediapipe/index.js";
-import type { HandLandmarkerResult } from "@mediapipe/tasks-vision";
+import { handsForDriver, PoseTracker } from "../../src/mediapipe/index.js";
+import type { DriverHands, Landmark, WorldLandmark } from "../../src/mediapipe/index.js";
 
 import { setupWebGL, minRestZ } from "../_shared/webgl.js";
 import { createMediaPipe, mediaPipeAssetsFromQuery } from "../_shared/mediapipe-loader.js";
@@ -32,7 +31,6 @@ const t0 = performance.now();
 const model = await loadAnnyModel("/anny_model.json", "/anny_model.bin");
 statusEl.textContent = `Anny loaded ${(performance.now() - t0).toFixed(0)} ms — starting MediaPipe…`;
 
-const boneIndex  = buildBoneIndex(model);
 const boneXforms = allocBoneTransforms(model.boneCount);
 const vertBuf    = allocVertexBuffer(model);
 const nrmBuf     = allocNormalBuffer(model);
@@ -69,21 +67,17 @@ recBtn.addEventListener("click", () => {
 let lastImageLm: Landmark[] | null = null;
 let smoothImageLm: Landmark[] | null = null;
 let smoothWorldLm: WorldLandmark[] | null = null;
-let smoothLeftHand: WorldLandmark[] | null = null;
-let smoothRightHand: WorldLandmark[] | null = null;
-let lastHandRes: HandLandmarkerResult | null = null;
+// Hands go raw into the tracker, which filters them against its natural-hand
+// prior and carries a hand through frames where MediaPipe misses it.
+const tracker = new PoseTracker(model);
 let handFrame = 0;
 let lastTs = -1;
 let lastDeltas: PoseDeltas | null = null;
+let handsSeen = "--";
+let poseMs = "0.0";
 let frameCount = 0, fpsTs = performance.now(), fps = 0;
 
 const LM_S = 0.5;     // pose body smoothing
-const HAND_S = 0.6;   // hand smoothing
-// Keep a lost hand's last pose for a few detections before releasing it.
-// Dropping it at once makes the palm snap: the forearm's pronation comes
-// from the hand, so the arm untwists the moment the hand blinks out.
-const HAND_HOLD = 10;
-let missL = 0, missR = 0;
 const SMOOTH = 0.25;  // screen-space placement smoothing
 
 let sCx = W / 2, sScale = 280, sFootY = H * 0.88;
@@ -98,9 +92,8 @@ function tick(): void {
   if (video.readyState >= 2 && now !== lastTs) {
     lastTs = now;
     const poseRes = poseLandmarker.detectForVideo(video, now);
-    if ((handFrame++ & 1) === 0) {
-      lastHandRes = handLandmarker.detectForVideo(video, now);
-    }
+    // Hands every other frame; in between the tracker carries them.
+    const handRes = (handFrame++ & 1) === 0 ? handLandmarker.detectForVideo(video, now) : null;
 
     if (poseRes.landmarks.length > 0) {
       lastImageLm   = poseRes.landmarks[0];
@@ -108,18 +101,18 @@ function tick(): void {
       smoothWorldLm = smoothLandmarks(smoothWorldLm, poseRes.worldLandmarks[0], LM_S);
 
       // Anatomical side from the pose wrists, 3D from the image landmarks,
-      // chirality matched to the side — see `handsForDriver`.
-      const hr = lastHandRes;
-      const { leftHand: lH, rightHand: rH } = hr
+      // chirality matched to the side, plus each hand's quality (size,
+      // label agreement) — see `handsForDriver`.
+      const hands: DriverHands = handRes
         ? handsForDriver(
-          { landmarks: hr.landmarks, handedness: hr.handedness.map(h => h[0]?.categoryName ?? "") },
+          { landmarks: handRes.landmarks, handedness: handRes.handedness.map(h => h[0]?.categoryName ?? "") },
           video.videoWidth, video.videoHeight, smoothImageLm,
         )
         : {};
-      missL = lH ? 0 : missL + 1;
-      missR = rH ? 0 : missR + 1;
-      smoothLeftHand  = lH ? smoothLandmarks(smoothLeftHand,  lH, HAND_S) : missL > HAND_HOLD ? null : smoothLeftHand;
-      smoothRightHand = rH ? smoothLandmarks(smoothRightHand, rH, HAND_S) : missR > HAND_HOLD ? null : smoothRightHand;
+      if (handRes) handsSeen = (hands.leftHand ? "L" : "-") + (hands.rightHand ? "R" : "-");
+      const t1 = performance.now();
+      lastDeltas = tracker.update({ pose: smoothWorldLm, ...hands }, now);
+      poseMs = (performance.now() - t1).toFixed(1);
     }
   }
 
@@ -131,7 +124,7 @@ function tick(): void {
   ctx.fillStyle = "#0a0a0f";
   ctx.fillRect(0, 0, W, H);
 
-  if (!smoothWorldLm || !smoothImageLm || !lastImageLm) {
+  if (!smoothWorldLm || !smoothImageLm || !lastImageLm || !lastDeltas) {
     ctx.fillStyle = "#555";
     ctx.font = "18px monospace";
     ctx.fillText("Stand in front of the camera…", W / 2 - 160, H / 2);
@@ -139,19 +132,8 @@ function tick(): void {
   }
 
   // ── Pose → mesh ──
-  const t1 = performance.now();
-  const deltas = landmarksToPoseDeltas({
-    pose:      smoothWorldLm,
-    leftHand:  smoothLeftHand  ?? undefined,
-    rightHand: smoothRightHand ?? undefined,
-    // Hold last good pose when MP visibility dips below threshold so limbs
-    // don't snap to spine during brief occlusions.
-    previousDeltas: lastDeltas ?? undefined,
-  }, model, boneIndex);
-  lastDeltas = deltas;
-  forwardKinematics(model, deltas, boneXforms);
+  forwardKinematics(model, lastDeltas, boneXforms);
   const mesh = lbs(model, boneXforms, vertBuf, nrmBuf);
-  const poseMs = (performance.now() - t1).toFixed(1);
 
   // ── Screen position from image-space pose ──
   const lS = smoothImageLm[11], rS = smoothImageLm[12];
@@ -182,8 +164,7 @@ function tick(): void {
 
   ctx.fillStyle = "#4f4";
   ctx.font = "12px monospace";
-  const hands = (smoothLeftHand ? "L" : "-") + (smoothRightHand ? "R" : "-");
-  ctx.fillText(`FK+LBS ${poseMs} ms   ${fps} fps   hands:${hands}`, 10, H - 10);
+  ctx.fillText(`driver ${poseMs} ms   ${fps} fps   hands:${handsSeen}`, 10, H - 10);
 }
 
 function drawMiniSkeleton(ctx: CanvasRenderingContext2D, lm: Landmark[]): void {

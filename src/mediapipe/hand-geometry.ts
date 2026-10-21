@@ -15,9 +15,10 @@
 
 import { MP_HAND } from "./constants.js";
 import {
-  frameXY, signedAngle, vcross, vdot, vneg, vnorm, vsub,
+  DEG, frameXY, signedAngle, vcross, vdot, vneg, vnorm, vsub,
   type Mat3, type Vec3,
 } from "./geom.js";
+import type { WorldLandmark } from "./types.js";
 
 export type HandSide = "L" | "R";
 
@@ -76,4 +77,45 @@ export function fingerAngles(p: readonly Vec3[], side: HandSide): FingerAngles {
     abd.push(sideSign * Math.asin(Math.max(-1, Math.min(1, vdot(vnorm(seg[1]), hinge)))));
   }
   return { flex, abd };
+}
+
+/** Thumb segment directions (CMC→MCP, MCP→IP, IP→TIP) in palm-frame coordinates. */
+export function thumbDirections(p: readonly Vec3[]): Vec3[] {
+  const F = palmFrame(p);
+  const seg = (a: number, b: number): Vec3 => {
+    const d = vnorm(vsub(p[b], p[a]));
+    return [F[0] * d[0] + F[3] * d[1] + F[6] * d[2], F[1] * d[0] + F[4] * d[1] + F[7] * d[2], F[2] * d[0] + F[5] * d[1] + F[8] * d[2]];
+  };
+  return [
+    seg(MP_HAND.THUMB_CMC, MP_HAND.THUMB_MCP),
+    seg(MP_HAND.THUMB_MCP, MP_HAND.THUMB_IP),
+    seg(MP_HAND.THUMB_IP, MP_HAND.THUMB_TIP),
+  ];
+}
+
+/** Mean PIP+DIP flexion over fingers 2–5 (radians, palmar positive). */
+function meanCurl(pts: readonly Vec3[], side: HandSide): number {
+  const a = fingerAngles(pts, side);
+  return a.flex.reduce((s, f) => s + f[1] + f[2], 0) / a.flex.length;
+}
+
+/** Fingers curling this far *away* from the palm on average mean mirrored chirality. */
+const CHIRALITY_CURL = 25 * DEG;
+
+/**
+ * Hand landmarks (MediaPipe camera axes) → Anny coordinates, depth-flipped
+ * if their chirality contradicts `side`.
+ *
+ * Fingers curling strongly *away* from the palm mean MediaPipe picked the
+ * mirror-image hand (its classic depth ambiguity — same 2D silhouette,
+ * opposite chirality). Reflecting depth about the wrist restores a hand of
+ * the right chirality with the same image projection.
+ */
+export function handPointsAnny(hand: readonly WorldLandmark[], side: HandSide, mirrorX = false): Vec3[] {
+  const sx = mirrorX ? -1 : 1;
+  const pts = hand.map((lm): Vec3 => [sx * lm.x, lm.z, -lm.y]);
+  if (meanCurl(pts, side) > -CHIRALITY_CURL) return pts;
+  const w = pts[MP_HAND.WRIST];
+  const flipped = pts.map((p): Vec3 => [p[0], 2 * w[1] - p[1], p[2]]);
+  return meanCurl(flipped, side) > meanCurl(pts, side) ? flipped : pts;
 }

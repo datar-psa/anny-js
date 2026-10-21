@@ -22,14 +22,9 @@ import {
 
 import { handSides, MP } from "../../src/mediapipe/index.js";
 import type { Landmark } from "../../src/mediapipe/index.js";
-import type { Detection, HandDetection, HandSide, PoseModel } from "../roundtrip/protocol.js";
+import type { Detection, DetectOptions, HandDetection, HandSide, PoseModel } from "../roundtrip/protocol.js";
 
 type Source = HTMLCanvasElement | HTMLImageElement;
-
-export interface DetectOptions {
-  /** Run the pose landmarker (default true). */
-  pose?: boolean;
-}
 
 export class Detector {
   private constructor(
@@ -37,6 +32,8 @@ export class Detector {
     private handFull: HandLandmarker,
     private handRoi: HandLandmarker,
     private crop: HTMLCanvasElement,
+    private scaled: HTMLCanvasElement,
+    private augmented: HTMLCanvasElement,
   ) {}
 
   static async create(poseModel: PoseModel): Promise<Detector> {
@@ -59,7 +56,7 @@ export class Detector {
     ]);
     const crop = document.createElement("canvas");
     crop.width = crop.height = 256;
-    return new Detector(pose, handFull, handRoi, crop);
+    return new Detector(pose, handFull, handRoi, crop, document.createElement("canvas"), document.createElement("canvas"));
   }
 
   /**
@@ -67,8 +64,12 @@ export class Detector {
    *   hallucinates a body around a lone forearm, and ROI crops around its
    *   fake wrists then miss the real hand.
    */
-  detect(src: Source, opts: DetectOptions = {}): Detection {
-    const width = src.width, height = src.height;
+  detect(original: Source, opts: DetectOptions = {}): Detection {
+    const width = original.width, height = original.height;
+    // Normalised landmarks are invariant to a uniform rescale, so detecting on
+    // an upscaled copy needs no mapping back.
+    const scaledSrc = opts.upscaleTo ? this.upscale(original, opts.upscaleTo) : original;
+    const src = opts.augment ? this.augmentImage(scaledSrc, opts.augment) : scaledSrc;
     const poseRes = opts.pose === false ? { landmarks: [], worldLandmarks: [] } : this.pose.detect(src);
     const pose = poseRes.landmarks.length > 0
       ? { image: plain(poseRes.landmarks[0]), world: plain(poseRes.worldLandmarks[0]) }
@@ -77,6 +78,35 @@ export class Detector {
     const hands = pose ? this.roiHands(src, pose.image) : [];
     if (hands.length === 0) hands.push(...this.fullHands(src, pose?.image));
     return { width, height, pose, hands };
+  }
+
+  private upscale(src: Source, width: number): HTMLCanvasElement {
+    const c = this.scaled;
+    c.width = width;
+    c.height = Math.round(width * src.height / src.width);
+    const ctx = c.getContext("2d");
+    if (!ctx) throw new Error("2d context unavailable");
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "medium";
+    ctx.drawImage(src, 0, 0, c.width, c.height);
+    return c;
+  }
+
+  private augmentImage(src: Source, a: NonNullable<DetectOptions["augment"]>): HTMLCanvasElement {
+    const c = this.augmented;
+    c.width = src.width;
+    c.height = src.height;
+    const ctx = c.getContext("2d");
+    if (!ctx) throw new Error("2d context unavailable");
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.save();
+    ctx.translate(c.width * (0.5 + a.dx), c.height * (0.5 + a.dy));
+    ctx.rotate(a.rotDeg * Math.PI / 180);
+    ctx.scale(a.scale, a.scale);
+    ctx.drawImage(src, -src.width / 2, -src.height / 2);
+    ctx.restore();
+    return c;
   }
 
   private fullHands(src: Source, poseImg?: Landmark[]): HandDetection[] {

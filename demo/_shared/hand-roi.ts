@@ -23,7 +23,7 @@
 
 import type { HandLandmarker, HandLandmarkerResult, NormalizedLandmark } from "@mediapipe/tasks-vision";
 
-import type { HandDetections, Landmark, WorldLandmark } from "../../src/mediapipe/index.js";
+import type { HandDetections, Landmark } from "../../src/mediapipe/index.js";
 
 export interface HandRoiOptions {
   /**
@@ -61,57 +61,6 @@ function avg(lms: ReadonlyArray<Landmark>, k: "x" | "y"): number {
   let s = 0;
   for (const lm of lms) s += lm[k];
   return s / lms.length;
-}
-
-// Five wrist→knuckle directions that characterise the hand's overall pose.
-// Used by `isHandOutlier` to spot noisy detections — they tend to splay one
-// finger wildly while the others stay still, so a large angular delta on any
-// of these signals "this is noise, not real motion".
-//   thumb_CMC (1), index_MCP (5), middle_MCP (9), ring_MCP (13), pinky_MCP (17)
-const HAND_DIR_TARGETS = [1, 5, 9, 13, 17] as const;
-
-function angleDeg(ax: number, ay: number, az: number, bx: number, by: number, bz: number): number {
-  const aLen = Math.hypot(ax, ay, az) || 1;
-  const bLen = Math.hypot(bx, by, bz) || 1;
-  const dot  = (ax*bx + ay*by + az*bz) / (aLen * bLen);
-  return Math.acos(Math.max(-1, Math.min(1, dot))) * 180 / Math.PI;
-}
-
-/**
- * Decide whether `fresh` is too far from `prev` to be a plausible next frame.
- *
- * Compares the wrist→knuckle direction for five fingers; if the *max* angular
- * delta across them exceeds `maxAngleDeg`, treat `fresh` as a noisy detection
- * and reject it (the caller should hold the previous smoothed pose instead).
- *
- * `prev` null means "no history yet" — always accept the first detection.
- *
- * Why max rather than mean: real hand motion moves fingers together (all
- * fingers swing through similar deltas during a wave or punch). Noise typically
- * jerks one or two fingers far while the others stay put — the max delta
- * captures that asymmetry, while a mean would average it away.
- */
-export function isHandOutlier(
-  prev: ReadonlyArray<WorldLandmark> | null,
-  fresh: ReadonlyArray<WorldLandmark>,
-  maxAngleDeg = 60,
-): boolean {
-  if (!prev || prev.length === 0) return false;
-  const wF = fresh[0], wP = prev[0];   // MP_HAND.WRIST = 0
-  if (!wF || !wP) return false;
-
-  let maxDelta = 0;
-  for (const k of HAND_DIR_TARGETS) {
-    const f = fresh[k], p = prev[k];
-    if (!f || !p) continue;
-    const d = angleDeg(
-      f.x - wF.x, f.y - wF.y, f.z - wF.z,
-      p.x - wP.x, p.y - wP.y, p.z - wP.z,
-    );
-    if (d > maxDelta) maxDelta = d;
-    if (maxDelta > maxAngleDeg) return true;   // early out
-  }
-  return false;
 }
 
 /** Lightweight debug record so callers (Playwright/devtools) can see what the ROI did. */

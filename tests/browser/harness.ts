@@ -3,7 +3,7 @@
  * by Playwright from Node (`tests/roundtrip/client.ts`):
  *
  *   init(opts)                       load Anny + MediaPipe
- *   detectUrl(url)                   MediaPipe on an image served by the harness server
+ *   detectUrl(url, det)              MediaPipe on an image served by the harness server
  *   render(deltas, cam, opts)        FK → LBS → pinhole render, returns PNG data URL
  *   renderAndDetect(deltas, cam, o)  render, then MediaPipe on the render
  *
@@ -24,7 +24,7 @@ type WireDeltas = (number[] | null)[];
 
 interface Harness {
   init(opts: HarnessInit): Promise<{ loadMs: number }>;
-  detectUrl(url: string): Promise<Detection>;
+  detectUrl(url: string, det?: DetectOptions): Promise<Detection>;
   render(deltas: WireDeltas, cam: CameraSpec, opts?: RenderOptions): string;
   renderAndDetect(deltas: WireDeltas, cam: CameraSpec, opts?: RenderOptions, det?: DetectOptions): { detection: Detection; png: string };
 }
@@ -67,8 +67,8 @@ const harness: Harness = {
     detector = await Detector.create(opts.poseModel);
     return { loadMs: performance.now() - t0 };
   },
-  async detectUrl(url) {
-    return ready().detector.detect(await loadImage(url));
+  async detectUrl(url, det) {
+    return ready().detector.detect(await loadImage(url), det);
   },
   render(deltas, cam, opts) {
     return draw(deltas, cam, opts).toDataURL("image/png");

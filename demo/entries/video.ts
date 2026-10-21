@@ -1,17 +1,17 @@
 /** Pre-recorded video → MediaPipe (heavy) → Anny demo with a fixture picker. */
 
 import {
-  loadAnnyModel, buildBoneIndex, allocBoneTransforms,
+  loadAnnyModel, allocBoneTransforms,
   lbs, allocVertexBuffer, allocNormalBuffer, forwardKinematics,
 } from "../../src/anny/index.js";
 import type { PoseDeltas } from "../../src/anny/index.js";
-import { handsForDriver, landmarksToPoseDeltas, MP_HAND } from "../../src/mediapipe/index.js";
-import type { HandDetections, Landmark, WorldLandmark } from "../../src/mediapipe/index.js";
+import { handsForDriver, MP_HAND, PoseTracker } from "../../src/mediapipe/index.js";
+import type { DriverHands, HandDetections, Landmark, WorldLandmark } from "../../src/mediapipe/index.js";
 
 import { setupWebGL, minRestZ } from "../_shared/webgl.js";
 import { createMediaPipe, mediaPipeAssetsFromQuery } from "../_shared/mediapipe-loader.js";
 import { smoothLandmarks } from "../_shared/smoothing.js";
-import { HandRoiDetector, isHandOutlier } from "../_shared/hand-roi.js";
+import { HandRoiDetector } from "../_shared/hand-roi.js";
 import {
   computeQuadrants, buildFourViews, drawFourViews, drawDividers,
   buildSplitView, drawSplitView, drawSplitDivider,
@@ -58,7 +58,6 @@ const t0 = performance.now();
 const model = await loadAnnyModel("/anny_model.json", "/anny_model.bin");
 statusEl.textContent = `Anny loaded ${(performance.now() - t0).toFixed(0)} ms — starting MediaPipe…`;
 
-const boneIndex  = buildBoneIndex(model);
 const boneXforms = allocBoneTransforms(model.boneCount);
 const vertBuf    = allocVertexBuffer(model);
 const nrmBuf     = allocNormalBuffer(model);
@@ -78,24 +77,26 @@ statusEl.textContent = "MediaPipe ready — loading video…";
 
 const gl = setupWebGL(glCanvas, model);
 
-// ── Smoothed state (declared up-front so loadFixture can reset on switch) ──
+// ── Tracking state (declared up-front so loadFixture can reset on switch) ──
+// The body pose is smoothed as landmarks; hands go raw into the tracker,
+// which filters them against its natural-hand prior (see PoseTracker).
+const tracker = new PoseTracker(model);
 let lastImageLm: Landmark[] | null = null;
 let smoothImageLm: Landmark[] | null = null;
 let smoothWorldLm: WorldLandmark[] | null = null;
-let smoothLeftHand: WorldLandmark[] | null = null;
-let smoothRightHand: WorldLandmark[] | null = null;
 let lastHandDet: HandDetections | null = null;
-let lastHands: { leftHand?: WorldLandmark[]; rightHand?: WorldLandmark[] } = {};
+let handsSeen = "--";
 let handFrame = 0;
-let lastTs = -1;
+let lastVideoTime = -1;
 let lastDeltas: PoseDeltas | null = null;
+let poseMs = "0.0";
 
 async function loadFixture(src: string, label: string) {
   lastImageLm = smoothImageLm = smoothWorldLm = null;
-  smoothLeftHand = smoothRightHand = null;
   lastHandDet = null;
-  lastHands = {};
   lastDeltas = null;
+  lastVideoTime = -1;
+  tracker.reset();
 
   video.src = src;
   await new Promise<void>(r => video.addEventListener("loadeddata", () => r(), { once: true }));
@@ -119,12 +120,6 @@ await loadFixture(clipParam ?? "/fixtures/boxer.mp4", clipParam ? "custom clip" 
 
 // ── Loop ────────────────────────────────────────────────────────────────
 const LM_S = 0.5;
-// HAND_S is lower than the body LM_S because hold-last (line ~130) means a
-// single noisy detection persists across dropout frames; aggressive smoothing
-// (low alpha) damps the visible effect of any one outlier detection. The
-// trade-off is finger motion lags real motion by ~3 frames, which is fine
-// for video where finger micro-movements aren't the focus.
-const HAND_S = 0.35;
 const SMOOTH = 0.25;
 
 // ── Hand tracking toggle ────────────────────────────────────────────────────
@@ -137,7 +132,7 @@ const handsBtn = document.getElementById("hands") as HTMLButtonElement | null;
 handsBtn?.addEventListener("click", () => {
   trackHands = !trackHands;
   handsBtn.classList.toggle("active", trackHands);
-  if (!trackHands) { smoothLeftHand = smoothRightHand = null; lastHandDet = null; lastHands = {}; }
+  if (!trackHands) { lastHandDet = null; tracker.reset(); }
 });
 
 let sScale = 280;
@@ -153,8 +148,11 @@ function tick(): void {
   if (now - lastFrame < 16) return;
   lastFrame = now;
 
-  if (video.readyState >= 2 && now !== lastTs) {
-    lastTs = now;
+  // One tracker update per NEW video frame: feeding it the same reading
+  // twice would make it overconfident.
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    if (video.currentTime < lastVideoTime) tracker.reset();   // looped or seeked
+    lastVideoTime = video.currentTime;
     const poseRes = poseLandmarker.detectForVideo(video, now);
 
     if (poseRes.landmarks.length > 0) {
@@ -163,18 +161,23 @@ function tick(): void {
       smoothWorldLm = smoothLandmarks(smoothWorldLm, poseRes.worldLandmarks[0], LM_S);
 
       // Hands: run the ROI detector every other frame (saves ~10 ms/frame;
-      // smoothing covers the gap). Full-frame detection fails on far-away
-      // subjects (hands < 5 % of the frame), hence the per-wrist crops.
+      // the tracker carries the hands through the gap). Full-frame detection
+      // fails on far-away subjects (hands < 5 % of the frame), hence the
+      // per-wrist crops.
+      let hands: DriverHands = {};
       if (trackHands && (handFrame++ & 1) === 0) {
         lastHandDet = handRoi.detect(video, smoothImageLm);
-        lastHands = handsForDriver(lastHandDet, video.videoWidth, video.videoHeight, smoothImageLm);
+        hands = handsForDriver(lastHandDet, video.videoWidth, video.videoHeight, smoothImageLm);
+        handsSeen = (hands.leftHand ? "L" : "-") + (hands.rightHand ? "R" : "-");
       }
-      // Hold-last + outlier reject: skip the smoothing update when the ROI
-      // missed this frame (fingers would snap to rest) or when the fresh
-      // detection jumps > 60° on any wrist→knuckle direction (a noise spike).
-      const lH = lastHands.leftHand, rH = lastHands.rightHand;
-      if (lH && !isHandOutlier(smoothLeftHand, lH)) smoothLeftHand = smoothLandmarks(smoothLeftHand, lH, HAND_S);
-      if (rH && !isHandOutlier(smoothRightHand, rH)) smoothRightHand = smoothLandmarks(smoothRightHand, rH, HAND_S);
+      const t1 = performance.now();
+      lastDeltas = tracker.update({
+        pose: smoothWorldLm,
+        ...hands,
+        // Lower threshold so half-occluded limbs still drive — noisy beats stuck-at-rest.
+        visibilityMin: 0.2,
+      }, video.currentTime * 1000);
+      poseMs = (performance.now() - t1).toFixed(1);
     }
   }
 
@@ -186,29 +189,15 @@ function tick(): void {
   ctx.fillStyle = "#0a0a0f";
   ctx.fillRect(0, 0, W, H);
 
-  if (!smoothWorldLm || !smoothImageLm || !lastImageLm) {
+  if (!smoothWorldLm || !smoothImageLm || !lastImageLm || !lastDeltas) {
     ctx.fillStyle = "#555";
     ctx.font = "18px monospace";
     ctx.fillText("Waiting for first pose…", W/2 - 120, H/2);
     return;
   }
 
-  const t1 = performance.now();
-  const deltas = landmarksToPoseDeltas({
-    pose:      smoothWorldLm,
-    leftHand:  smoothLeftHand  ?? undefined,
-    rightHand: smoothRightHand ?? undefined,
-    // Lower threshold so half-occluded limbs still drive — noisy beats stuck-at-rest.
-    visibilityMin: 0.2,
-    // Hold last good pose when MP visibility dips below threshold. Without
-    // this the arm snaps to spine on every confidence dip (boxer's guard
-    // hand sits at vis≈0.19 for ~15% of frames).
-    previousDeltas: lastDeltas ?? undefined,
-  }, model, boneIndex);
-  lastDeltas = deltas;
-  forwardKinematics(model, deltas, boneXforms);
+  forwardKinematics(model, lastDeltas, boneXforms);
   const mesh = lbs(model, boneXforms, vertBuf, nrmBuf);
-  const poseMs = (performance.now() - t1).toFixed(1);
 
   // Screen-space placement from image-space pose
   const lS = smoothImageLm[11], rS = smoothImageLm[12];
@@ -245,8 +234,7 @@ function tick(): void {
 
   ctx.fillStyle = "#4f4";
   ctx.font = "12px monospace";
-  const hands = (smoothLeftHand ? "L" : "-") + (smoothRightHand ? "R" : "-");
-  ctx.fillText(`FK+LBS ${poseMs} ms   ${fps} fps   hands:${hands}`, 10, H - 10);
+  ctx.fillText(`driver ${poseMs} ms   ${fps} fps   hands:${handsSeen}`, 10, H - 10);
 }
 
 /**

@@ -11,16 +11,17 @@
 import type { AnnyModel } from "../anny/types.js";
 import { MP_HAND } from "./constants.js";
 import {
-  axisAngle, frameXFirst, mT, mvec, vcross, vdot, vnorm, vsub,
+  axisAngle, frameXFirst, mmul, mT, mvec, vcross, vdot, vnorm, vsub,
   type Mat3, type Vec3,
 } from "./geom.js";
-import { fingerAngles, palmFrame, type HandSide } from "./hand-geometry.js";
+import { phalanxCapsule, type ThumbClearanceRig } from "./collide.js";
+import { FINGER_CHAINS, fingerAngles, palmarNormal, palmFrame, type HandSide } from "./hand-geometry.js";
 
 export type Side = HandSide;
 
 export interface LimbRig {
   upper: number;
-  /** Twist bone between `upper` and `lower` (left at identity). */
+  /** Twist bone between `upper` and `lower` (humeral / femoral rotation). */
   upper2: number;
   lower: number;
   lower2: number;
@@ -28,6 +29,8 @@ export interface LimbRig {
   end: number;
   /** `upper`-local unit vector toward the middle joint (elbow / knee). */
   upperAim: Vec3;
+  /** `upper2`-local unit vector toward the middle joint (its twist axis). */
+  upper2Aim: Vec3;
   /**
    * `upper`-local unit vector of the middle joint's flexion axis, oriented
    * like cross(upperDir, lowerDir) of a flexed limb.
@@ -49,6 +52,15 @@ export interface FingerRig {
   /** Rest [MCP, PIP, DIP] flexion, radians (hand-geometry convention). */
   restFlex: number[];
   restAbd: number;
+  /**
+   * The MCP's measurement frame at rest (world, unit): the metacarpal
+   * direction (wrist → MCP) and the flexion hinge ⊥ it and the palm normal,
+   * exactly as `fingerAngles` defines them.
+   */
+  restMetacarpal: Vec3;
+  restHinge: Vec3;
+  /** Proximal phalanx direction (MCP → PIP) in its own bone's local frame. */
+  proximalLocal: Vec3;
 }
 
 export interface HandRig {
@@ -62,6 +74,18 @@ export interface HandRig {
   abdSign: number;
   /** Δflexion per +rotation about a phalanx's local X (±1). */
   flexSign: number;
+  /** Wrist-local unit axis whose +rotation flexes the hand toward the palm. */
+  wristFlexAxis: Vec3;
+  /** Wrist-local unit axis whose +rotation deviates the hand toward the thumb (radial). */
+  wristRadialAxis: Vec3;
+  /** Capsules for keeping the thumb out of the fingers. */
+  thumbClearance: ThumbClearanceRig;
+  /**
+   * Palm-frame unit directions from the thumb's MCP and IP joints toward the
+   * index knuckle at rest: the side the thumb's pad faces, i.e. its flexion
+   * direction (as the hand-angle metrics define it).
+   */
+  thumbPad: [Vec3, Vec3];
 }
 
 export interface RigInfo {
@@ -129,6 +153,7 @@ function buildRigInfo(model: AnnyModel): RigInfo {
     return {
       upper: bone(upper), upper2: bone(upper2), lower: bone(lower), lower2: bone(lower2), end: bone(end),
       upperAim: aimLocal(upper, lower),
+      upper2Aim: aimLocal(upper2, lower),
       hinge: vnorm(mvec(mT(restR[bone(upper)]), hingeWorld)),
       lowerAim: aimLocal(lower, end),
       lower2Aim: aimLocal(lower2, end),
@@ -147,11 +172,20 @@ function buildRigInfo(model: AnnyModel): RigInfo {
   const hand = (s: Side): HandRig => {
     const pts = restHandPoints(s, head, restR, bone);
     const angles = fingerAngles(pts, s);
-    const fingers: FingerRig[] = [2, 3, 4, 5].map((f, i) => ({
-      bones: [bone(`finger${f}-1.${s}`), bone(`finger${f}-2.${s}`), bone(`finger${f}-3.${s}`)],
-      restFlex: angles.flex[i],
-      restAbd: angles.abd[i],
-    }));
+    const palmar = palmarNormal(palmFrame(pts), s);
+    const fingers: FingerRig[] = [2, 3, 4, 5].map((f, i) => {
+      const [mcp, pip] = FINGER_CHAINS[i];
+      const proximal = bone(`finger${f}-1.${s}`);
+      const metacarpal = vnorm(vsub(pts[mcp], pts[MP_HAND.WRIST]));
+      return {
+        bones: [proximal, bone(`finger${f}-2.${s}`), bone(`finger${f}-3.${s}`)],
+        restFlex: angles.flex[i],
+        restAbd: angles.abd[i],
+        restMetacarpal: metacarpal,
+        restHinge: vnorm(vcross(metacarpal, palmar)),
+        proximalLocal: vnorm(mvec(mT(restR[proximal]), vsub(pts[pip], pts[mcp]))),
+      };
+    });
     // Sign probes: rotate the middle finger's proximal phalanx about its own
     // local Z / X by a small angle and see which way the hand-geometry
     // abduction / flexion moves. Mirrored rigs flip Z but not X; probing
@@ -171,15 +205,30 @@ function buildRigInfo(model: AnnyModel): RigInfo {
       const delta = axisCol === 2 ? after.abd[1] - angles.abd[1] : after.flex[1][0] - angles.flex[1][0];
       return Math.sign(delta) || 1;
     };
+    const palmRest = palmFrame(pts);
     return {
       wrist: bone(`wrist.${s}`),
-      palmRest: palmFrame(pts),
+      palmRest,
       fingers,
       thumb: [bone(`finger1-1.${s}`), bone(`finger1-2.${s}`), bone(`finger1-3.${s}`)],
       abdSign: probe(2),
       flexSign: probe(0),
+      ...wristAxes(bone(`wrist.${s}`), pts, palmRest, s, restR),
+      thumbPad: [MP_HAND.THUMB_MCP, MP_HAND.THUMB_IP].map(j =>
+        vnorm(mvec(mT(palmRest), vsub(pts[MP_HAND.INDEX_MCP], pts[j])))) as [Vec3, Vec3],
+      thumbClearance: {
+        base: bone(`finger1-1.${s}`),
+        thumb: [capsule(`finger1-2.${s}`, `finger1-3.${s}`), capsule(`finger1-3.${s}`, null)],
+        fingers: [2, 3, 4].flatMap(f => [
+          capsule(`finger${f}-1.${s}`, `finger${f}-2.${s}`),
+          capsule(`finger${f}-2.${s}`, `finger${f}-3.${s}`),
+          capsule(`finger${f}-3.${s}`, null),
+        ]),
+      },
     };
   };
+  const capsule = (b: string, child: string | null) =>
+    phalanxCapsule(model, bone(b), child === null ? null : bone(child), restR, restHead);
 
   const leg = (s: Side) => ({
     ...limb(`upperleg01.${s}`, `upperleg02.${s}`, `lowerleg01.${s}`, `lowerleg02.${s}`, `foot.${s}`),
@@ -204,6 +253,36 @@ function buildRigInfo(model: AnnyModel): RigInfo {
     legs: { L: leg("L"), R: leg("R") },
     hands: { L: hand("L"), R: hand("R") },
   };
+}
+
+/**
+ * Probe the wrist bone: rotate the rest hand a little about each local axis
+ * and see where the middle knuckle goes. The axis that moves it most toward
+ * the palm is the flexion axis; the other one the deviation axis, signed
+ * toward the thumb. (In this rig: X deviates radially on both hands, Z flexes
+ * with opposite signs on the two hands.)
+ */
+function wristAxes(
+  wrist: number, pts: Vec3[], palmRest: Mat3, side: Side, restR: Mat3[],
+): { wristFlexAxis: Vec3; wristRadialAxis: Vec3 } {
+  const R = restR[wrist];
+  const head = pts[MP_HAND.WRIST];
+  const palmar = palmarNormal(palmRest, side);
+  const radial: Vec3 = [palmRest[0], palmRest[3], palmRest[6]];
+  const move = (local: Vec3): Vec3 => {
+    const rot = mmul(mmul(R, axisAngle(local, 0.1)), mT(R));
+    return vsub(mvec(rot, vsub(pts[MP_HAND.MIDDLE_MCP], head)), vsub(pts[MP_HAND.MIDDLE_MCP], head));
+  };
+  const axes: Vec3[] = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  const moves = axes.map(move);
+  const flexK = [0, 1, 2].reduce((best, k) => (Math.abs(vdot(moves[k], palmar)) > Math.abs(vdot(moves[best], palmar)) ? k : best), 0);
+  const devK = [0, 1, 2].filter(k => k !== flexK)
+    .reduce((best, k) => (Math.abs(vdot(moves[k], radial)) > Math.abs(vdot(moves[best], radial)) ? k : best));
+  const signed = (k: number, dir: Vec3): Vec3 => {
+    const sg = Math.sign(vdot(moves[k], dir)) || 1;
+    return [axes[k][0] * sg, axes[k][1] * sg, axes[k][2] * sg];
+  };
+  return { wristFlexAxis: signed(flexK, palmar), wristRadialAxis: signed(devK, radial) };
 }
 
 function midpoint(a: Vec3, b: Vec3): Vec3 {

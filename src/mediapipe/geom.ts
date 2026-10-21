@@ -192,3 +192,18 @@ export function twistAngle(m: Mat3, axis: Vec3): number {
   const p = q[0] * axis[0] + q[1] * axis[1] + q[2] * axis[2];
   return 2 * Math.atan2(p, q[3]);
 }
+
+/** Rotation vector (axis × angle, radians) of a rotation matrix. */
+export function rotVec(m: Mat3): Vec3 {
+  const q = quatFromMat3(m);
+  const s = Math.hypot(q[0], q[1], q[2]);
+  if (s < 1e-12) return [0, 0, 0];
+  const angle = 2 * Math.atan2(s, Math.abs(q[3])) * (q[3] < 0 ? -1 : 1);
+  return [q[0] / s * angle, q[1] / s * angle, q[2] / s * angle];
+}
+
+/** Rotation matrix of a rotation vector (axis × angle, radians). */
+export function fromRotVec(r: Vec3): Mat3 {
+  const a = vlen(r);
+  return a < 1e-12 ? IDENTITY : axisAngle(vscale(r, 1 / a), a);
+}

@@ -19,6 +19,7 @@ import {
 import { handCamera, handPoints, type Driver, type RunContext } from "./run.js";
 import { handJointsAnny, PosedSkeleton, toMpWorld } from "./skeleton.js";
 import { allocBoneTransforms, forwardKinematics } from "../../src/anny/index.js";
+import { palmLengthPx } from "../../src/mediapipe/index.js";
 
 /** Deterministic PRNG (mulberry32). */
 export function rng(seed: number): () => number {
@@ -112,15 +113,18 @@ export function handPoseDeltas(spec: HandPoseSpec, boneIndex: Map<string, number
     d[i] = m;
   };
   const s = spec.side;
+  // Abduction (local Z) is mirrored between the hands: the same spread fans
+  // both hands' fingers apart.
+  const zSign = s === "R" ? 1 : -1;
   // Natural curl split MCP : PIP : DIP for a fully closed finger.
   const FULL = [80, 100, 70];
   [2, 3, 4, 5].forEach((f, i) => {
-    set(`finger${f}-1.${s}`, mul3(rot([1, 0, 0], FULL[0] * spec.curl[i]), rot([0, 0, 1], spec.spread[i])));
+    set(`finger${f}-1.${s}`, mul3(rot([1, 0, 0], FULL[0] * spec.curl[i]), rot([0, 0, 1], zSign * spec.spread[i])));
     set(`finger${f}-2.${s}`, rot([1, 0, 0], FULL[1] * spec.curl[i]));
     set(`finger${f}-3.${s}`, rot([1, 0, 0], FULL[2] * spec.curl[i]));
   });
   const [tmx, tmz, tmcp, tip] = spec.thumb;
-  set(`finger1-1.${s}`, mul3(rot([1, 0, 0], tmx), rot([0, 0, 1], tmz)));
+  set(`finger1-1.${s}`, mul3(rot([1, 0, 0], tmx), rot([0, 0, 1], zSign * tmz)));
   set(`finger1-2.${s}`, rot([1, 0, 0], tmcp));
   set(`finger1-3.${s}`, rot([1, 0, 0], tip));
   set(`wrist.${s}`, mul3(rot([1, 0, 0], spec.wrist[0]), rot([0, 0, 1], spec.wrist[1])));
@@ -167,7 +171,12 @@ export async function runSyntheticHand(ctx: RunContext, spec: HandPoseSpec, driv
   const world = handPoints(h, cam.W, cam.H, ctx.handSource, spec.side);
   res.mp = handAngles(world, spec.side);
   res.mpVsGt = compareHands(gt, res.mp);
-  const driven = driver(spec.side === "L" ? { leftHand: world } : { rightHand: world }, ctx.model, ctx.boneIndex);
+  // With the quality `handsForDriver` would attach: size and label agreement.
+  const quality = { palmPx: palmLengthPx(h.image, cam.W, cam.H), labelAgrees: h.labelSide === spec.side };
+  const driven = driver(
+    spec.side === "L" ? { leftHand: world, leftHandQuality: quality } : { rightHand: world, rightHandQuality: quality },
+    ctx.model, ctx.boneIndex,
+  );
   const drivenJoints = handOf(ctx, driven, spec.side);
   res.driven = handAngles(toMpWorld(drivenJoints), spec.side);
   // The driver doesn't place the hand, only orients it: compare shapes after

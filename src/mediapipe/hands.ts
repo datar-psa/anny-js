@@ -1,5 +1,5 @@
 import { MP, MP_HAND } from "./constants.js";
-import type { Landmark, WorldLandmark } from "./types.js";
+import type { HandQuality, Landmark, WorldLandmark } from "./types.js";
 
 export type HandSide = "L" | "R";
 
@@ -114,12 +114,29 @@ export interface HandDetections {
   handedness: string[];
 }
 
+/** Driver inputs for the hands of one frame (spread into `PoseInput`). */
+export interface DriverHands {
+  leftHand?: WorldLandmark[];
+  rightHand?: WorldLandmark[];
+  leftHandQuality?: HandQuality;
+  rightHandQuality?: HandQuality;
+}
+
+/** Palm length (wrist → middle MCP) of normalised hand landmarks, in pixels. */
+export function palmLengthPx(image: Landmark[], width: number, height: number): number {
+  const w = image[MP_HAND.WRIST], m = image[MP_HAND.MIDDLE_MCP];
+  return Math.hypot((m.x - w.x) * width, (m.y - w.y) * height);
+}
+
 /**
- * MediaPipe Hand results → `leftHand` / `rightHand` for `landmarksToPoseDeltas`.
+ * MediaPipe Hand results → `leftHand` / `rightHand` (+ their quality) for
+ * `landmarksToPoseDeltas`.
  *
  * The recommended path: anatomical side via `handSides`, 3D from the image
  * landmarks (`handLandmarks3D`), chirality matched to the side
- * (`matchHandChirality`). The first detection per side wins.
+ * (`matchHandChirality`), and a `HandQuality` per hand so the driver can
+ * weigh the reading against its natural-hand prior. The first detection per
+ * side wins.
  *
  * @param det        Hand detections for this frame.
  * @param width      Image width in px.
@@ -131,13 +148,18 @@ export function handsForDriver(
   width: number,
   height: number,
   poseImage?: Landmark[],
-): { leftHand?: WorldLandmark[]; rightHand?: WorldLandmark[] } {
-  const out: { leftHand?: WorldLandmark[]; rightHand?: WorldLandmark[] } = {};
+): DriverHands {
+  const out: DriverHands = {};
   const sides = handSides(det.landmarks, det.handedness, poseImage, width, height);
   sides.forEach((side, i) => {
     const key = side === "L" ? "leftHand" : "rightHand";
     if (out[key]) return;
-    out[key] = matchHandChirality(handLandmarks3D(det.landmarks[i], width, height), side, det.handedness[i] ?? "");
+    const label = det.handedness[i] ?? "";
+    out[key] = matchHandChirality(handLandmarks3D(det.landmarks[i], width, height), side, label);
+    out[side === "L" ? "leftHandQuality" : "rightHandQuality"] = {
+      palmPx: palmLengthPx(det.landmarks[i], width, height),
+      labelAgrees: label === "" || (label === "Left") === (side === "L"),
+    };
   });
   return out;
 }

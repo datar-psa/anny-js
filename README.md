@@ -320,31 +320,40 @@ task validate        # full reports
 
 ---
 
-## Deploying the demo site
+## CI/CD
 
-GitHub Actions (`.github/workflows/ci.yml`) deploys the demo to
-[anny-js.clad.you](https://anny-js.clad.you) (Firebase Hosting site `anny-js`
-on `clad-main`) after the unit **and** headless MediaPipe tests pass: every PR
-gets a 7-day preview channel with its URL commented on the PR, and every push
-to `main` goes live. Both deploy the exact build the tests ran against.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml), no stored credentials:
 
-One-time setup — a service account that can deploy Hosting and nothing else:
+| Trigger | What happens |
+|---|---|
+| push to any branch | unit + headless MediaPipe tests → demo deployed to the branch's own **preview channel** (URL on the run and the PR's deployment) |
+| push to `main` | tests → **[anny-js.clad.you](https://anny-js.clad.you)** |
+| tag `anny-js/v*` (`task ship`) | tests → **npm** publish with provenance + GitHub release with notes from Conventional Commits |
+| branch deleted | its preview channel is removed |
+| PR from a fork | tests only |
 
-```bash
-SA=anny-js-deploy@clad-main.iam.gserviceaccount.com
-gcloud iam service-accounts create anny-js-deploy --project clad-main \
-  --display-name "anny-js demo deploys (GitHub Actions)"
-for role in roles/firebasehosting.admin roles/serviceusage.apiKeysViewer; do
-  gcloud projects add-iam-policy-binding clad-main --member "serviceAccount:$SA" --role "$role" --condition None
-done
-gcloud iam service-accounts keys create key.json --iam-account "$SA"
-gh secret set FIREBASE_SERVICE_ACCOUNT_CLAD_MAIN --repo datar-psa/anny-js < key.json && rm key.json
-```
+Deploys use the exact demo build the tests ran on. GCP access is keyless
+(Workload Identity Federation: only workflows in `datar-psa/anny-js` can
+impersonate a deployer with Firebase Hosting Admin + API Keys Viewer), and so
+is npm (trusted publishing).
 
-Deliberately not granted: `roles/firebaseauth.admin`, which the deploy action's
-docs suggest only so preview URLs get added to Firebase Auth's authorized
-domains — the demo has no login, and on `clad-main` it would hand CI the
-PWA's users. `task deploy` still deploys from a logged-in machine.
+**One-time setup**
+
+1. In clad: `task tf-gcp-org` (enables the IAM/STS APIs), then `task tf-gcp-github`.
+2. Repository variables (Settings → Secrets and variables → Actions → *Variables*)
+   from `tofu -chdir=ops/gcp/github output`:
+   `GCP_WORKLOAD_IDENTITY_PROVIDER` ← `workload_identity_provider`,
+   `GCP_DEPLOY_SERVICE_ACCOUNT` ← `anny_js_deploy_service_account`.
+   Until they're set, previews are skipped and `main` deploys fail loudly.
+3. npmjs.com → `anny-js` → Settings → Trusted Publisher → GitHub Actions:
+   organization `datar-psa`, repository `anny-js`, workflow `ci.yml`,
+   environment `npm`. Then disallow token publishing for the package.
+4. Optional but recommended: protect the `production` and `npm` environments
+   (deployment branches `main` / tags `anny-js/v*`, required reviewers).
+
+Releasing: on an up-to-date `main`, `task ship` (or `BUMP=minor task ship`)
+bumps `package.json`, tags `anny-js/vX.Y.Z` and pushes; CI does the rest.
+`task deploy` remains as a break-glass manual deploy from a logged-in machine.
 
 ---
 

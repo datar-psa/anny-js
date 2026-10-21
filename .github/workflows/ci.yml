@@ -1,42 +1,61 @@
-# CI + demo deploys for anny-js.
+# anny-js CI/CD.
 #
-#   check    typecheck, unit + parity tests, library and demo builds
-#   browser  real MediaPipe in headless Chromium: synthetic hands, labelled
-#            photos and demo clips through the round trip (tests/browser)
-#   preview  PRs: deploy the tested demo build to a Firebase Hosting preview
-#            channel and comment the URL on the PR
-#   deploy   pushes to main: deploy the tested demo build to anny-js.clad.you
+#   check       typecheck, unit + parity tests, library and demo builds
+#   browser     real MediaPipe in headless Chromium (tests/browser)
+#   preview     every pushed branch → its own Firebase Hosting preview channel
+#   production  main → anny-js.clad.you
+#   release     anny-js/v* tag (from `task ship`) → npm + GitHub release
 #
-# Needs one repository secret, FIREBASE_SERVICE_ACCOUNT_CLAD_MAIN: a JSON key
-# for a service account on clad-main with roles/firebasehosting.admin and
-# roles/serviceusage.apiKeysViewer. Nothing else — in particular NOT
-# roles/firebaseauth.admin (the action's docs suggest it only to add preview
-# URLs to Firebase Auth's authorized domains; this demo has no login, and on
-# clad-main it would let CI manage the PWA's users).
+# Deploys and publishes use the exact demo build / commit the tests passed on.
+# No stored credentials:
+#   • GCP via Workload Identity Federation (clad: ops/gcp/github). Repository
+#     variables GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_DEPLOY_SERVICE_ACCOUNT
+#     hold its outputs (identifiers, not secrets).
+#   • npm via trusted publishing (OIDC), configured on npmjs.com for this
+#     workflow file and the `npm` environment.
+# Same-repo PRs are covered by the branch push; the pull_request trigger only
+# runs tests for PRs from forks (which never get deploy credentials).
+#
+# Actions are pinned to commit SHAs (version in the trailing comment). Untrusted
+# event data reaches shell steps only through env vars, never inline.
 
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
+    tags: ['anny-js/v*']
   pull_request:
+  delete:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'delete' && 'delete' || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   BUN_VERSION: 1.4.2
+  NODE_VERSION: 22
+  FIREBASE_TOOLS: firebase-tools@15.32.1
+  FIREBASE_PROJECT: clad-main
 
 jobs:
   check:
+    # Skip: same-repo PRs (the branch push runs), and `task ship` version-bump
+    # commits on main (the tag pushed with them runs instead).
+    if: >-
+      github.event_name != 'delete' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository) &&
+      !(github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore: bump'))
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ env.BUN_VERSION }}
       - run: bun install --frozen-lockfile
@@ -48,10 +67,11 @@ jobs:
         run: bunx tsc
       - name: Build demo site
         run: bunx vite build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-demo
           path: dist-demo
+          if-no-files-found: error
           retention-days: 7
 
   browser:
@@ -59,8 +79,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ env.BUN_VERSION }}
       - run: bun install --frozen-lockfile
@@ -69,7 +91,7 @@ jobs:
           bunx playwright install --with-deps chromium
           command -v ffmpeg || { sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg; }
       - name: Cache MediaPipe models + test photos
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             .cache/mediapipe
@@ -83,45 +105,171 @@ jobs:
           ANNY_BROWSER: "1"
 
   preview:
-    # Fork PRs get no secrets, so they can't deploy previews.
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    # Every branch push except main. Skipped (not failed) until the WIF
+    # variables exist, so forks and fresh clones stay green.
+    if: >-
+      github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') &&
+      github.ref != 'refs/heads/main' && vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
     needs: [check, browser]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
-      checks: write
-      pull-requests: write
+      id-token: write
+    environment:
+      name: preview
+      url: ${{ steps.deploy.outputs.url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist-demo
           path: dist-demo
-      - uses: FirebaseExtended/action-hosting-deploy@v0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          repoToken: ${{ secrets.GITHUB_TOKEN }}
-          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_CLAD_MAIN }}
-          projectId: clad-main
-          expires: 7d
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - name: Deploy preview channel
+        id: deploy
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          channel="$(.github/scripts/preview-channel.sh "$BRANCH")"
+          npx --yes "$FIREBASE_TOOLS" hosting:channel:deploy "$channel" \
+            --project "$FIREBASE_PROJECT" --expires 7d --json > deploy.json
+          url="$(jq -er '.result | to_entries[0].value.url' deploy.json)" || { cat deploy.json; exit 1; }
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Demo preview for \`$BRANCH\`"
+            echo "$url (channel \`$channel\`, expires 7 days after the last push)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-  deploy:
+  production:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [check, browser]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
     environment:
-      name: anny-js-demo
+      name: production
       url: https://anny-js.clad.you
     concurrency:
-      group: deploy-anny-js-demo
+      group: anny-js-production
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: Require deploy configuration
+        env:
+          WIF: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          SA: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+        run: |
+          [ -n "$WIF" ] && [ -n "$SA" ] || {
+            echo "::error::Set repository variables GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_DEPLOY_SERVICE_ACCOUNT (outputs of clad ops/gcp/github)."
+            exit 1
+          }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist-demo
           path: dist-demo
-      - uses: FirebaseExtended/action-hosting-deploy@v0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_CLAD_MAIN }}
-          projectId: clad-main
-          channelId: live
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - name: Deploy anny-js.clad.you
+        run: |
+          npx --yes "$FIREBASE_TOOLS" deploy --only hosting --project "$FIREBASE_PROJECT" \
+            --non-interactive --message "${GITHUB_SHA::12} (run $GITHUB_RUN_ID)"
+
+  preview-cleanup:
+    # Branch deleted → drop its preview channel (they also expire on their own).
+    if: >-
+      github.event_name == 'delete' && github.event.ref_type == 'branch' &&
+      vars.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - name: Delete preview channel
+        env:
+          BRANCH: ${{ github.event.ref }}
+        run: |
+          channel="$(.github/scripts/preview-channel.sh "$BRANCH")"
+          npx --yes "$FIREBASE_TOOLS" hosting:channel:delete "$channel" \
+            --project "$FIREBASE_PROJECT" --site anny-js --force \
+            || echo "No channel $channel (already expired or never deployed)."
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/anny-js/v')
+    needs: [check, browser]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write  # GitHub release
+      id-token: write  # npm trusted publishing (OIDC) + provenance
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/anny-js
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0  # previous tag for release notes; main for the ancestry check
+          persist-credentials: false
+      - name: Tag must match package.json and be on main
+        run: |
+          version="${GITHUB_REF_NAME#anny-js/v}"
+          pkg="$(jq -r .version package.json)"
+          [ "$version" = "$pkg" ] || { echo "::error::tag $GITHUB_REF_NAME but package.json says $pkg"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::$GITHUB_REF_NAME is not on main"; exit 1; }
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - name: Build library
+        run: rm -rf dist && bunx tsc
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: npm with trusted publishing (≥ 11.5.1)
+        run: npm install -g npm@11.21.0
+      - name: Pack
+        run: npm pack
+      - name: Publish to npm (OIDC, provenance)
+        run: npm publish ./anny-js-*.tgz --access public
+      - name: Release notes
+        run: .github/scripts/release-notes.sh "$GITHUB_REF_NAME" > release-notes.md
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: anny-js-*.tgz
+          make_latest: true
